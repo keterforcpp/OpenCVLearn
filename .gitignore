@@ -1,0 +1,32 @@
+# Visual Studio IDE 缓存
+.vs/
+
+# 编译输出和 NuGet 还原缓存
+bin/
+obj/
+
+# 测试用图片和生成的结果图（图片不进仓库，本地自留）
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.gif
+*.tif
+*.tiff
+*.webp
+
+# 视频文件
+*.mp4
+*.avi
+*.mkv
+
+# 模型参数文件
+*.onnx
+*.pt
+*.weights
+*.pb
+*.caffemodel
+
+# 敏感文件
+*.env
+*secret*
