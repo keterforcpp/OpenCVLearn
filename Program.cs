@@ -14,7 +14,7 @@ using System.Security.Cryptography;
 // ============================================================
 
 // ---------- 1. 读取并灰度化 ----------
-Mat src = Cv2.ImRead(@"3.jpg", ImreadModes.Color);
+Mat src = Cv2.ImRead(@"2.png", ImreadModes.Color);
 if (src.Empty())
 {
     Console.WriteLine("读取失败：请确认 3.jpg 在项目输出目录（bin/Debug/net8.0）中");
@@ -108,8 +108,8 @@ for (int y = 0; y < height - 1; y++)
     for (int x = 0; x < width - 1; x++)
     {
         // 噪声门槛：符号相反(过零) 且 幅度差足够大(不是平坦区的±几抖动)
-        if ((laplacian.At<short>(y, x) * laplacian.At<short>(y + 1, x) < 0 && Math.Abs(laplacian.At<short>(y, x) - laplacian.At<short>(y + 1, x)) > 80)
-            || (laplacian.At<short>(y, x) * laplacian.At<short>(y, x + 1) < 0 && Math.Abs(laplacian.At<short>(y, x) - laplacian.At<short>(y, x + 1)) > 80))
+        if ((laplacian.At<short>(y, x) * laplacian.At<short>(y + 1, x) < 0 && Math.Abs(laplacian.At<short>(y, x) - laplacian.At<short>(y + 1, x)) > 20)
+            || (laplacian.At<short>(y, x) * laplacian.At<short>(y, x + 1) < 0 && Math.Abs(laplacian.At<short>(y, x) - laplacian.At<short>(y, x + 1)) > 20))
         {
             laplacianfix.Set(y, x, (byte)255);
         }
@@ -140,17 +140,17 @@ Cv2.Canny(gray, cannyHigh, 180, 360); // 阈值高 → 只剩最强烈的边缘
 Console.WriteLine("阈值实验完成");
 
 // ---------- 7. 展示全部结果 ----------
-Cv2.ImShow("1-灰度原图", gray);
+//Cv2.ImShow("1-灰度原图", gray);
 //Cv2.ImShow("2-手写水平差分(只测竖直边)", manualDx);
 //Cv2.ImShow("2-手写竖直差分(只测水平边)", manualDy);
 //Cv2.ImShow("2-叠加水平竖直", dst);
 //Cv2.ImShow("2-手写水平竖直", manualDxy);
-Cv2.ImShow("3-Sobel梯度模长", magnitude8); 
+//Cv2.ImShow("3-Sobel梯度模长", magnitude8); 
 Cv2.ImShow("4-Laplacian(先模糊)", laplacian8);
 Cv2.ImShow("4-Laplacian修复版本", laplacianfix);
 Cv2.ImShow("5-Canny(100,200)经典", canny);
 //Cv2.ImShow("6-Canny低阈值(30,60)", cannyLow);
-Cv2.ImShow("7-Canny高阈值(180,360)", cannyHigh);
+//Cv2.ImShow("7-Canny高阈值(180,360)", cannyHigh);
 Cv2.WaitKey(0);
 Cv2.DestroyAllWindows();
 
