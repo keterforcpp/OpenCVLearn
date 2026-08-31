@@ -1,117 +1,140 @@
-using Emgu.CV.Structure;
 using OpenCvSharp;
 
 // ============================================================
-// 第一课：图像的本质 —— 像素、通道与灰度化
+// 第二课：滤波与卷积 —— 图像处理的"万能地基"
 // ============================================================
 // 理论核心：
-// 1. 数字图像在计算机中就是一个"数字矩阵"（二维数组）
-// 2. 灰度图：单通道矩阵，每个像素是一个 0~255 的数（0=黑，255=白）
-// 3. 彩色图：三通道矩阵（BGR），每个像素由蓝、绿、红三个数共同表示
-//    注意：OpenCV 默认通道顺序是 BGR，不是 RGB，这是历史原因
-// 4. 灰度化公式：Gray = 0.299*R + 0.587*G + 0.114*B
-//    三个权重来自人眼感光特性——人眼对绿色最敏感，对蓝色最不敏感
+// 1. 卷积：用一个小矩阵（卷积核/滤波器）在图像上滑动，
+//    每个位置：核的每个数 × 对应像素，全部加起来 = 该点新值
+// 2. 卷积核的"形状"决定效果：
+//    - 全是 1/n 的核（均值） → 模糊（邻域平均，抹平差异）
+//    - 中心高四周低的钟形核（高斯）→ 更自然的模糊（近邻权重大）
+//    - 中心为正、周围为负的核    → 锐化（放大与邻域的差异）
+// 3. 边界问题：核滑到图像边缘会"越界"，OpenCV 自动补边处理
 // ============================================================
 
-// ---------- 1. 读取图像：把磁盘文件解码成数字矩阵 ----------
-// Mat 是 OpenCV 最核心的类，代表一个矩阵（图像就是矩阵）
-// ImreadModes.Color 强制按彩色读取（即使原图是灰度图也会转成 3 通道）
+// ---------- 1. 读取并灰度化（第一课的知识：滤波通常在灰度图上做） ----------
 Mat src = Cv2.ImRead(@"3.jpg", ImreadModes.Color);
-
-// 健壮性检查：文件不存在或路径错误时 src 会是空的，直接使用会崩溃
 if (src.Empty())
 {
     Console.WriteLine("读取失败：请确认 3.jpg 在项目输出目录（bin/Debug/net8.0）中");
     return;
 }
+Mat gray = new Mat();
+Cv2.CvtColor(src, gray, ColorConversionCodes.BGR2GRAY);
+Console.WriteLine($"图像: {src.Width}x{src.Height}，已灰度化");
 
-// ---------- 2. 观察图像的"数字属性" ----------
-// 这一步很重要：从"看图"思维切换到"看矩阵"思维
-Console.WriteLine($"图像尺寸: {src.Width} x {src.Height} 像素");
-Console.WriteLine($"通道数: {src.Channels()}（彩色图=3，灰度图=1）");
-Console.WriteLine($"数据类型: {src.Type()}（CV_8UC3 = 8位无符号整数 x 3通道）");
-Console.WriteLine($"总像素数: {src.Width * src.Height}");
-Console.WriteLine();
+int height = gray.Height;
+int width = gray.Width;
 
-// ---------- 3. 直接访问像素：亲眼看到"图像就是数字" ----------
-// Mat 的像素访问用索引器：mat[y, x] —— 注意顺序是 [行, 列] 即 [y, x]
-// 取图像中心的一个像素
-int cy = src.Height / 2;
-int cx = src.Width / 2;
-Vec3b centerPixel = src.At<Vec3b>(cy, cx); // Vec3b = 3个 byte 组成的向量
-Console.WriteLine($"中心像素({cx},{cy})的 BGR 值: B={centerPixel.Item0} G={centerPixel.Item1} R={centerPixel.Item2}");
-Console.WriteLine();
+// ---------- 2. 手写 3x3 均值滤波：亲手理解卷积过程 ----------
+// 卷积核：       [1 1 1]
+//               [1 1 1]  ÷ 9    每个像素 = 自己和周围8个邻居的平均值
+//               [1 1 1]
+Mat manualBlur = new Mat(height, width, MatType.CV_8UC1);
 
-// ---------- 4. 手写灰度化：理解公式，不调用现成函数 ----------
-// 创建一个单通道 8 位图像存放结果（尺寸与原图相同）
-Mat manualGray = new Mat(src.Height, src.Width, MatType.CV_8UC1);
-
-// 遍历所有像素（注意：这种逐像素方式慢，仅用于学习原理，后面会讲高效写法）
-// 性能要点：Height/Width 是 P/Invoke 调用（每次都跨到 C++ 原生层取值），
-// 写在循环条件里会被调用上百万次，必须先缓存成局部变量
-int height = src.Height;
-int width = src.Width;
-for (int y = 0; y < height; y++)
+// 注意循环从 1 开始到 -1 结束：最外圈 1 像素是"边界"，邻居不全，
+// 简单起见保持原值不处理（OpenCV 内部会用复制边界等方式补齐）
+for (int y = 1; y < height - 1; y++)
 {
-    for (int x = 0; x < width; x++)
+    for (int x = 1; x < width - 1; x++)
     {
-        Vec3b pixel = src.At<Vec3b>(y, x);
-        // 灰度化加权公式：人眼敏感度加权 G > R > B
-        byte gray = (byte)(0.299 * pixel.Item2   // R
-                         + 0.587 * pixel.Item1   // G
-                         + 0.114 * pixel.Item0); // B
-        gray = (byte)(gray > 127 ? 255 : 0);
-        manualGray.Set(y, x, gray);
+        int sum = 0;
+        // 遍历 3x3 邻域：dy/dx 是相对中心点的偏移量
+        for (int dy = -1; dy <= 1; dy++)
+        {
+            for (int dx = -1; dx <= 1; dx++)
+            {
+                sum += gray.At<byte>(y + dy, x + dx);
+            }
+        }
+        manualBlur.Set(y, x, (byte)(sum / 9));
     }
 }
-Console.WriteLine("手写灰度化完成");
-
-// ---------- 5. 调用 OpenCV 内置函数做同样的件事 ----------
-// Cv2.CvtColor 是颜色空间转换函数，BGR2GRAY 内部也用同样的加权公式
-// 但它是优化过的实现（SIMD 指令），比逐像素循环快几个数量级
-Mat cvtGray = new Mat();
-Cv2.CvtColor(src, cvtGray, ColorConversionCodes.BGR2GRAY);
-Cv2.Threshold(cvtGray, cvtGray, 127, 255, ThresholdTypes.Binary);
-
-// 验证两种方法结果是否一致：Cv2.Absdiff 计算两图差的绝对值
-Mat diff = new Mat();
-Cv2.Absdiff(manualGray, cvtGray, diff);
-// CountNonZero 统计非零像素数，即"结果不同的像素个数"
-// 由于浮点转整数的舍入方式差异，允许极少量像素相差 1
-int differentPixels = Cv2.CountNonZero(diff);
-Console.WriteLine($"手写与内置函数结果不同的像素数: {differentPixels}（应为0或极少）");
-Console.WriteLine();
-
-// ---------- 6. 像素级操作实战：手动调亮图像 ----------
-// 理论：亮度 = 每个像素值加同一个常数；对比度 = 像素值乘同一个系数
-// 注意 byte 溢出问题：200 + 100 = 300 > 255，必须截断到 255
-Mat bright = new Mat(src.Height, src.Width, MatType.CV_8UC3);
+// 边界一圈复制原值（简单处理，让图完整）
+for (int x = 0; x < width; x++)
+{
+    manualBlur.Set(0, x, gray.At<byte>(0, x));
+    manualBlur.Set(height - 1, x, gray.At<byte>(height - 1, x));
+}
 for (int y = 0; y < height; y++)
 {
-    for (int x = 0; x < width; x++)
-    {
-        Vec3b p = src.At<Vec3b>(y, x);
-        byte nb = (byte)Math.Min(p.Item0 + 60, 255); // 截断防溢出
-        byte ng = (byte)Math.Min(p.Item1 + 60, 255);
-        byte nr = (byte)Math.Min(p.Item2 + 60, 255);
-        bright.Set(y, x, new Vec3b(nb, ng, nr));
-    }
+    manualBlur.Set(y, 0, gray.At<byte>(y, 0));
+    manualBlur.Set(y, width - 1, gray.At<byte>(y, width - 1));
 }
-Console.WriteLine("加亮完成（每像素 +60，超过255截断）");
+Console.WriteLine("手写 3x3 均值滤波完成");
 
-// ---------- 7. 展示结果 ----------
-Cv2.ImShow("1-原图(BGR三通道)", src);
-Cv2.ImShow("2-手写二值化", manualGray);
-Cv2.ImShow("3-内置函数二值化", cvtGray);
-Cv2.ImShow("4-加亮图(+60)", bright);
+// ---------- 3. 内置均值滤波：一行搞定同样的事 ----------
+Mat blur3 = new Mat();
+Cv2.Blur(gray, blur3, new Size(3, 3));   // 3x3 均值
+Mat blur15 = new Mat();
+Cv2.Blur(gray, blur15, new Size(15, 15)); // 15x15：核越大越模糊
+Console.WriteLine("内置均值滤波完成（对比 3x3 与 15x15 核大小的差异）");
+
+// ---------- 4. 高斯滤波：加权平均的模糊 ----------
+// 与均值滤波的区别：核里的权重不是平均分配，而是二维高斯分布（钟形）
+// 中心像素权重最大，越远权重越小 → 模糊效果更自然，边缘残留更少
+Mat gaussian = new Mat();
+Cv2.GaussianBlur(gray, gaussian, new Size(15, 15), 0);
+// 第三个参数：核大小（宽高必须为奇数，保证有唯一的中心点）
+// 第四个参数：标准差 sigma，0 表示由核大小自动推算（核越大 sigma 越大）
+Console.WriteLine("高斯滤波完成（对比与同尺寸均值滤波的差异）");
+
+// ---------- 5. 锐化：负权重核 ----------
+// 锐化核：       [ 0 -1  0]
+//               [-1  5 -1]   中心 5 倍强调自己，四周减去邻居
+//               [ 0 -1  0]
+// 原理：输出 = 5×自己 - 上下左右邻居 → 差异被放大，边缘更"锐"
+// 核内所有数之和 = 1（5-4），保证整体亮度不变；若和为 0 输出会全黑
+Mat sharpened = new Mat();
+InputArray kernel = InputArray.Create<float>(new float[,]
+{
+    {  0, -1,  0 },
+    { -1,  5, -1 },
+    {  0, -1,  0 }
+});
+Cv2.Filter2D(gray, sharpened, -1, kernel, anchor: new Point(-1, -1));
+// Filter2D：通用卷积函数，任何自定义核都用它执行
+// depth 参数 -1：输出深度与输入相同（8位）
+// anchor：核的锚点，(-1,-1) 表示核中心对准当前像素（默认值）
+
+// ---------- 6. 添加噪点 + 中值滤波（去椒盐噪声专用） ----------
+// 实验设计：故意撒黑白噪点，看哪种滤波能救回来
+Mat noisy = gray.Clone(); // Clone：完整复制一份，两图互不影响
+Random rand = new Random(42);
+for (int i = 0; i < 5000; i++)
+{
+    int y = rand.Next(height);
+    int x = rand.Next(width);
+    noisy.Set(y, x, (byte)(rand.Next(2) * 255)); // 随机撒纯黑或纯白点
+}
+// 先用均值滤波试（会被噪声"拖累"，越滤越脏）
+Mat noisyBlur = new Mat();
+Cv2.Blur(noisy, noisyBlur, new Size(5, 5));
+// 再用中值滤波试：取邻域所有值"排序后的中间值"，极端黑白点直接被排掉
+Mat noisyMedian = new Mat();
+Cv2.MedianBlur(noisy, noisyMedian, 5);
+Console.WriteLine("噪点实验完成：对比均值 vs 中值的去噪效果");
+
+// ---------- 7. 展示全部结果 ----------
+Cv2.ImShow("1-灰度原图", gray);
+Cv2.ImShow("2-手写3x3均值", manualBlur);
+Cv2.ImShow("3-内置3x3均值", blur3);
+Cv2.ImShow("4-内置15x15均值(核越大越糊)", blur15);
+Cv2.ImShow("5-高斯15x15(更自然)", gaussian);
+Cv2.ImShow("6-锐化", sharpened);
+Cv2.ImShow("7-加了噪点的图", noisy);
+Cv2.ImShow("8-均值去噪(不行)", noisyBlur);
+Cv2.ImShow("9-中值去噪(干净)", noisyMedian);
 Cv2.WaitKey(0);
 Cv2.DestroyAllWindows();
 
 // ============================================================
 // 本课小结：
-// 1. 图像 = 矩阵，灰度图是单通道 2D 数组，彩色图是三通道数组
-// 2. OpenCV 通道顺序是 BGR；像素访问 mat[y, x]
-// 3. 灰度化公式 Gray = 0.299R + 0.587G + 0.114B 源自人眼特性
-// 4. byte 运算注意 0~255 溢出截断
-// 5. 逐像素循环慢但适合理解原理，实际项目用内置函数
+// 1. 卷积 = 小核矩阵滑过全图，加权求和得到新像素
+// 2. 核的内容决定效果：全正平均→模糊；中心负权重→锐化
+// 3. 核越大模糊越强；高斯权重比平均权重更自然
+// 4. 中值滤波是非线性"排序"操作，对椒盐噪声特效
+//    （均值/高斯是线性"加权"操作，对椒盐噪声无能为力）
+// 5. Filter2D 是执行任意自定义核的通用接口
 // ============================================================
