@@ -1,3 +1,4 @@
+using Emgu.CV.Structure;
 using OpenCvSharp;
 
 // ============================================================
@@ -59,6 +60,7 @@ for (int y = 0; y < height; y++)
         byte gray = (byte)(0.299 * pixel.Item2   // R
                          + 0.587 * pixel.Item1   // G
                          + 0.114 * pixel.Item0); // B
+        gray = (byte)(gray > 127 ? 255 : 0);
         manualGray.Set(y, x, gray);
     }
 }
@@ -69,6 +71,7 @@ Console.WriteLine("手写灰度化完成");
 // 但它是优化过的实现（SIMD 指令），比逐像素循环快几个数量级
 Mat cvtGray = new Mat();
 Cv2.CvtColor(src, cvtGray, ColorConversionCodes.BGR2GRAY);
+Cv2.Threshold(cvtGray, cvtGray, 127, 255, ThresholdTypes.Binary);
 
 // 验证两种方法结果是否一致：Cv2.Absdiff 计算两图差的绝对值
 Mat diff = new Mat();
@@ -98,8 +101,8 @@ Console.WriteLine("加亮完成（每像素 +60，超过255截断）");
 
 // ---------- 7. 展示结果 ----------
 Cv2.ImShow("1-原图(BGR三通道)", src);
-Cv2.ImShow("2-手写灰度化", manualGray);
-Cv2.ImShow("3-内置函数灰度化", cvtGray);
+Cv2.ImShow("2-手写二值化", manualGray);
+Cv2.ImShow("3-内置函数二值化", cvtGray);
 Cv2.ImShow("4-加亮图(+60)", bright);
 Cv2.WaitKey(0);
 Cv2.DestroyAllWindows();
