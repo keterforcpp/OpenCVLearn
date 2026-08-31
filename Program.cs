@@ -1,4 +1,5 @@
 using OpenCvSharp;
+using System.Security.Cryptography;
 
 // ============================================================
 // 第三课：边缘检测 —— 找出图像中"亮度突变"的位置
@@ -39,6 +40,33 @@ for (int y = 0; y < height; y++)
 }
 Console.WriteLine("手写水平差分完成（只对竖直边缘敏感）");
 
+Mat manualDy = new Mat(height, width, MatType.CV_8UC1);
+for (int y = 0; y < height-1; y++)
+{
+    for (int x = 0; x < width; x++)
+    {
+        int diff = gray.At<byte>(y+1, x) - gray.At<byte>(y, x); // 右 - 左
+        // diff 可能为负（从亮变暗），取绝对值表示"变化强度"，不看方向
+        manualDy.Set(y, x, (byte)Math.Min(Math.Abs(diff), 255));
+    }
+}
+Console.WriteLine("手写竖直差分完成（只对水平边缘敏感）");
+
+//叠加图片
+Mat dst = new Mat();
+Cv2.Add(manualDx, manualDy, dst);
+
+Mat manualDxy = new Mat(height, width, MatType.CV_8UC1);
+for (int y = 0; y < height - 1; y++)
+{
+    for (int x = 0; x < width-1; x++)
+    {
+        int diff = gray.At<byte>(y + 1, x) - gray.At<byte>(y, x)+ gray.At<byte>(y , x+1) - gray.At<byte>(y,x); 
+        // diff 可能为负（从亮变暗），取绝对值表示"变化强度"，不看方向
+        manualDxy.Set(y, x, (byte)Math.Min(Math.Abs(diff), 255));
+    }
+}
+
 // ---------- 3. Sobel 算子：3x3 的梯度近似 ----------
 // Sobel 水平核 Gx：         垂直核 Gy：
 //   [-1 0 1]                  [-1 -2 -1]
@@ -74,6 +102,24 @@ Mat laplacian8 = new Mat();
 Cv2.ConvertScaleAbs(laplacian, laplacian8);
 Console.WriteLine("Laplacian 完成（对比 Sobel：细边缘多但噪点也多）");
 
+Mat laplacianfix = new Mat(height, width, MatType.CV_8UC1);
+for (int y = 0; y < height - 1; y++)
+{
+    for (int x = 0; x < width - 1; x++)
+    {
+        // 噪声门槛：符号相反(过零) 且 幅度差足够大(不是平坦区的±几抖动)
+        if ((laplacian.At<short>(y, x) * laplacian.At<short>(y + 1, x) < 0 && Math.Abs(laplacian.At<short>(y, x) - laplacian.At<short>(y + 1, x)) > 80)
+            || (laplacian.At<short>(y, x) * laplacian.At<short>(y, x + 1) < 0 && Math.Abs(laplacian.At<short>(y, x) - laplacian.At<short>(y, x + 1)) > 80))
+        {
+            laplacianfix.Set(y, x, (byte)255);
+        }
+        else {
+
+            laplacianfix.Set(y, x, (byte)0);
+        }
+    }
+}
+
 // ---------- 5. Canny：工程上最好用的边缘检测器 ----------
 // Canny 内部流水线（理解它 = 理解所有前人的积累）：
 //   ① 高斯滤波去噪（第二课）
@@ -95,11 +141,15 @@ Console.WriteLine("阈值实验完成");
 
 // ---------- 7. 展示全部结果 ----------
 Cv2.ImShow("1-灰度原图", gray);
-Cv2.ImShow("2-手写水平差分(只测竖直边)", manualDx);
-Cv2.ImShow("3-Sobel梯度模长", magnitude8);
+//Cv2.ImShow("2-手写水平差分(只测竖直边)", manualDx);
+//Cv2.ImShow("2-手写竖直差分(只测水平边)", manualDy);
+//Cv2.ImShow("2-叠加水平竖直", dst);
+//Cv2.ImShow("2-手写水平竖直", manualDxy);
+Cv2.ImShow("3-Sobel梯度模长", magnitude8); 
 Cv2.ImShow("4-Laplacian(先模糊)", laplacian8);
+Cv2.ImShow("4-Laplacian修复版本", laplacianfix);
 Cv2.ImShow("5-Canny(100,200)经典", canny);
-Cv2.ImShow("6-Canny低阈值(30,60)", cannyLow);
+//Cv2.ImShow("6-Canny低阈值(30,60)", cannyLow);
 Cv2.ImShow("7-Canny高阈值(180,360)", cannyHigh);
 Cv2.WaitKey(0);
 Cv2.DestroyAllWindows();
