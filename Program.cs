@@ -1,19 +1,18 @@
 using OpenCvSharp;
 
 // ============================================================
-// 第二课：滤波与卷积 —— 图像处理的"万能地基"
+// 第三课：边缘检测 —— 找出图像中"亮度突变"的位置
 // ============================================================
 // 理论核心：
-// 1. 卷积：用一个小矩阵（卷积核/滤波器）在图像上滑动，
-//    每个位置：核的每个数 × 对应像素，全部加起来 = 该点新值
-// 2. 卷积核的"形状"决定效果：
-//    - 全是 1/n 的核（均值） → 模糊（邻域平均，抹平差异）
-//    - 中心高四周低的钟形核（高斯）→ 更自然的模糊（近邻权重大）
-//    - 中心为正、周围为负的核    → 锐化（放大与邻域的差异）
-// 3. 边界问题：核滑到图像边缘会"越界"，OpenCV 自动补边处理
+// 1. 边缘 = 亮度发生剧烈变化的地方（物体轮廓、纹理分界）
+// 2. 数学工具：梯度（导数）。一维信号里变化最快的地方导数最大；
+//    二维图像里用梯度模长衡量"变化强度"，方向指明"变化朝向"
+// 3. 数字图像是离散的，导数用"差分"近似：
+//    水平梯度 ≈ 右边像素 - 左边像素（Sobel 算子）
+// 4. Canny 是经典流水线：高斯去噪 → 求梯度 → 非极大值抑制 → 双阈值筛选
 // ============================================================
 
-// ---------- 1. 读取并灰度化（第一课的知识：滤波通常在灰度图上做） ----------
+// ---------- 1. 读取并灰度化 ----------
 Mat src = Cv2.ImRead(@"3.jpg", ImreadModes.Color);
 if (src.Empty())
 {
@@ -22,119 +21,95 @@ if (src.Empty())
 }
 Mat gray = new Mat();
 Cv2.CvtColor(src, gray, ColorConversionCodes.BGR2GRAY);
-Console.WriteLine($"图像: {src.Width}x{src.Height}，已灰度化");
 
+// ---------- 2. 手写水平差分：最原始的"边缘检测" ----------
+// 一维视角：f(x+1) - f(x) 变化越大，说明这里越可能是竖直边缘
+// 对应卷积核 [ -1  1 ]（水平方向差分，检测竖直边缘）
 int height = gray.Height;
 int width = gray.Width;
-
-// ---------- 2. 手写 3x3 均值滤波：亲手理解卷积过程 ----------
-// 卷积核：       [1 1 1]
-//               [1 1 1]  ÷ 9    每个像素 = 自己和周围8个邻居的平均值
-//               [1 1 1]
-Mat manualBlur = new Mat(height, width, MatType.CV_8UC1);
-
-// 注意循环从 1 开始到 -1 结束：最外圈 1 像素是"边界"，邻居不全，
-// 简单起见保持原值不处理（OpenCV 内部会用复制边界等方式补齐）
-for (int y = 1; y < height - 1; y++)
-{
-    for (int x = 1; x < width - 1; x++)
-    {
-        int sum = 0;
-        // 遍历 3x3 邻域：dy/dx 是相对中心点的偏移量
-        for (int dy = -1; dy <= 1; dy++)
-        {
-            for (int dx = -1; dx <= 1; dx++)
-            {
-                sum += gray.At<byte>(y + dy, x + dx);
-            }
-        }
-        manualBlur.Set(y, x, (byte)(sum / 9));
-    }
-}
-// 边界一圈复制原值（简单处理，让图完整）
-for (int x = 0; x < width; x++)
-{
-    manualBlur.Set(0, x, gray.At<byte>(0, x));
-    manualBlur.Set(height - 1, x, gray.At<byte>(height - 1, x));
-}
+Mat manualDx = new Mat(height, width, MatType.CV_8UC1);
 for (int y = 0; y < height; y++)
 {
-    manualBlur.Set(y, 0, gray.At<byte>(y, 0));
-    manualBlur.Set(y, width - 1, gray.At<byte>(y, width - 1));
+    for (int x = 0; x < width - 1; x++)
+    {
+        int diff = gray.At<byte>(y, x + 1) - gray.At<byte>(y, x); // 右 - 左
+        // diff 可能为负（从亮变暗），取绝对值表示"变化强度"，不看方向
+        manualDx.Set(y, x, (byte)Math.Min(Math.Abs(diff), 255));
+    }
 }
-Console.WriteLine("手写 3x3 均值滤波完成");
+Console.WriteLine("手写水平差分完成（只对竖直边缘敏感）");
 
-// ---------- 3. 内置均值滤波：一行搞定同样的事 ----------
-Mat blur3 = new Mat();
-Cv2.Blur(gray, blur3, new Size(3, 3));   // 3x3 均值
-Mat blur15 = new Mat();
-Cv2.Blur(gray, blur15, new Size(15, 15)); // 15x15：核越大越模糊
-Console.WriteLine("内置均值滤波完成（对比 3x3 与 15x15 核大小的差异）");
+// ---------- 3. Sobel 算子：3x3 的梯度近似 ----------
+// Sobel 水平核 Gx：         垂直核 Gy：
+//   [-1 0 1]                  [-1 -2 -1]
+//   [-2 0 2]                  [ 0  0  0]
+//   [-1 0 1]                  [ 1  2  1]
+// 本质还是差分（右边减左边），但上下加了权重
+// → 中间行权重 2，抗噪更好；同时兼顾上下邻居
+Mat sobelX = new Mat(); // 水平梯度：对竖直边缘响应强
+Mat sobelY = new Mat(); // 垂直梯度：对水平边缘响应强
+Cv2.Sobel(gray, sobelX, MatType.CV_16S, 1, 0, 3); // dx=1, dy=0：求水平梯度
+Cv2.Sobel(gray, sobelY, MatType.CV_16S, 0, 1, 3); // dx=0, dy=1：求垂直梯度
+// 注意 depth 用 CV_16S：梯度有正有负（方向信息），8位装不下负数！
 
-// ---------- 4. 高斯滤波：加权平均的模糊 ----------
-// 与均值滤波的区别：核里的权重不是平均分配，而是二维高斯分布（钟形）
-// 中心像素权重最大，越远权重越小 → 模糊效果更自然，边缘残留更少
-Mat gaussian = new Mat();
-Cv2.GaussianBlur(gray, gaussian, new Size(15, 15), 0);
-// 第三个参数：核大小（宽高必须为奇数，保证有唯一的中心点）
-// 第四个参数：标准差 sigma，0 表示由核大小自动推算（核越大 sigma 越大）
-Console.WriteLine("高斯滤波完成（对比与同尺寸均值滤波的差异）");
+// 梯度模长 = sqrt(Gx² + Gy²)，衡量"变化强度"（OpenCV 用近似公式 |Gx|+|Gy| 提速）
+Mat magnitude = new Mat();
+Cv2.AddWeighted(sobelX, 0.5, sobelY, 0.5, 0, magnitude);   // 简化：加权求和
+// 把 16 位结果转回 8 位便于显示（负值已在上一步被组合抵消大半，这里做线性缩放）
+Mat magnitude8 = new Mat();
+Cv2.ConvertScaleAbs(magnitude, magnitude8); // |x| 后线性压到 0~255
+Console.WriteLine("Sobel 梯度计算完成");
 
-// ---------- 5. 锐化：负权重核 ----------
-// 锐化核：       [ 0 -1  0]
-//               [-1  5 -1]   中心 5 倍强调自己，四周减去邻居
-//               [ 0 -1  0]
-// 原理：输出 = 5×自己 - 上下左右邻居 → 差异被放大，边缘更"锐"
-// 核内所有数之和 = 1（5-4），保证整体亮度不变；若和为 0 输出会全黑
-Mat sharpened = new Mat();
-InputArray kernel = InputArray.Create<float>(new float[,]
-{
-    {  0, -1,  0 },
-    { -1,  5, -1 },
-    {  0, -1,  0 }
-});
-Cv2.Filter2D(gray, sharpened, -1, kernel, anchor: new Point(-1, -1));
-// Filter2D：通用卷积函数，任何自定义核都用它执行
-// depth 参数 -1：输出深度与输入相同（8位）
-// anchor：核的锚点，(-1,-1) 表示核中心对准当前像素（默认值）
+// ---------- 4. Laplacian 算子：二阶导数找边缘 ----------
+// 拉普拉斯核：          [ 0 -1  0]
+//                      [-1  4 -1]
+//                      [ 0 -1  0]
+// 一阶导数（Sobel）在斜坡上是平台，二阶导数在边缘处是"尖峰"→ 定位更准
+// 缺点：对噪声极其敏感（导数放大噪声），通常先高斯模糊再用
+Mat blurred = new Mat();
+Cv2.GaussianBlur(gray, blurred, new Size(5, 5), 0); // 先去噪（LoG 思想的雏形）
+Mat laplacian = new Mat();
+Cv2.Laplacian(blurred, laplacian, MatType.CV_16S, 3);
+Mat laplacian8 = new Mat();
+Cv2.ConvertScaleAbs(laplacian, laplacian8);
+Console.WriteLine("Laplacian 完成（对比 Sobel：细边缘多但噪点也多）");
 
-// ---------- 6. 添加噪点 + 中值滤波（去椒盐噪声专用） ----------
-// 实验设计：故意撒黑白噪点，看哪种滤波能救回来
-Mat noisy = gray.Clone(); // Clone：完整复制一份，两图互不影响
-Random rand = new Random(42);
-for (int i = 0; i < 5000; i++)
-{
-    int y = rand.Next(height);
-    int x = rand.Next(width);
-    noisy.Set(y, x, (byte)(rand.Next(2) * 255)); // 随机撒纯黑或纯白点
-}
-// 先用均值滤波试（会被噪声"拖累"，越滤越脏）
-Mat noisyBlur = new Mat();
-Cv2.Blur(noisy, noisyBlur, new Size(5, 5));
-// 再用中值滤波试：取邻域所有值"排序后的中间值"，极端黑白点直接被排掉
-Mat noisyMedian = new Mat();
-Cv2.MedianBlur(noisy, noisyMedian, 5);
-Console.WriteLine("噪点实验完成：对比均值 vs 中值的去噪效果");
+// ---------- 5. Canny：工程上最好用的边缘检测器 ----------
+// Canny 内部流水线（理解它 = 理解所有前人的积累）：
+//   ① 高斯滤波去噪（第二课）
+//   ② Sobel 求梯度（本课第3节）
+//   ③ 非极大值抑制：梯度图上的"粗边缘"削成 1 像素细线
+//      （沿梯度方向只保留变化最强的那个像素，其余抹掉）
+//   ④ 双阈值筛选：高于高阈值=强边缘(保留)；低于低阈值=噪声(丢弃)；
+//      两者之间=弱边缘，只有连着强边缘才保留（滞后阈值，抗断线）
+Mat canny = new Mat();
+Cv2.Canny(gray, canny, 100, 200); // 低阈值100，高阈值200
+Console.WriteLine("Canny 完成（推荐 2:1 ~ 3:1 的阈值比）");
+
+// ---------- 6. 阈值参数实验：感受双阈值的作用 ----------
+Mat cannyLow = new Mat();
+Cv2.Canny(gray, cannyLow, 30, 60);   // 阈值低 → 边缘多而杂（噪声也被当边缘）
+Mat cannyHigh = new Mat();
+Cv2.Canny(gray, cannyHigh, 180, 360); // 阈值高 → 只剩最强烈的边缘
+Console.WriteLine("阈值实验完成");
 
 // ---------- 7. 展示全部结果 ----------
 Cv2.ImShow("1-灰度原图", gray);
-Cv2.ImShow("2-手写3x3均值", manualBlur);
-Cv2.ImShow("3-内置3x3均值", blur3);
-Cv2.ImShow("4-内置15x15均值(核越大越糊)", blur15);
-Cv2.ImShow("5-高斯15x15(更自然)", gaussian);
-Cv2.ImShow("6-锐化", sharpened);
-Cv2.ImShow("7-加了噪点的图", noisy);
-Cv2.ImShow("8-均值去噪(不行)", noisyBlur);
-Cv2.ImShow("9-中值去噪(干净)", noisyMedian);
+Cv2.ImShow("2-手写水平差分(只测竖直边)", manualDx);
+Cv2.ImShow("3-Sobel梯度模长", magnitude8);
+Cv2.ImShow("4-Laplacian(先模糊)", laplacian8);
+Cv2.ImShow("5-Canny(100,200)经典", canny);
+Cv2.ImShow("6-Canny低阈值(30,60)", cannyLow);
+Cv2.ImShow("7-Canny高阈值(180,360)", cannyHigh);
 Cv2.WaitKey(0);
 Cv2.DestroyAllWindows();
 
 // ============================================================
 // 本课小结：
-// 1. 卷积 = 小核矩阵滑过全图，加权求和得到新像素
-// 2. 核的内容决定效果：全正平均→模糊；中心负权重→锐化
-// 3. 核越大模糊越强；高斯权重比平均权重更自然
-// 4. 中值滤波是非线性"排序"操作，对椒盐噪声特效
-//    （均值/高斯是线性"加权"操作，对椒盐噪声无能为力）
-// 5. Filter2D 是执行任意自定义核的通用接口
+// 1. 边缘 = 亮度突变；检测边缘 = 求导数（梯度）
+// 2. 一阶导数：Sobel（带抗噪加权的差分），输出有正负 → 用 16S
+// 3. 二阶导数：Laplacian，定位准但对噪声敏感，先模糊再用
+// 4. Canny = 去噪+梯度+非极大值抑制+双阈值的完整流水线，
+//    工程首选；两个阈值按 2:1~3:1 配
+// 5. 手写差分核 [-1 1] 是一切边缘检测的种子原型
 // ============================================================
