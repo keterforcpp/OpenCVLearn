@@ -1,17 +1,18 @@
 using OpenCvSharp;
 
 // ============================================================
-// 第四课：二值化与形态学操作 —— 处理"区域"的数学
+// 第五课：轮廓提取与物体计数 —— 前四课的总装项目
 // ============================================================
-// 理论核心：
-// 1. 二值化：灰度图 → 只有 0/255 两值的图，是"区域分析"的前提
-//    Otsu 法：让计算机自动找最佳阈值（类间方差最大化）
-// 2. 形态学：用小核（结构元素）扫描二值图，但运算不是加权求和，
-//    而是"取最值"——本质仍是卷积框架的变体
-//    - 腐蚀 Erode：邻域内取最小值 → 白色区域"缩"（细节被啃掉）
-//    - 膨胀 Dilate：邻域内取最大值 → 白色区域"胀"（小洞被填上）
-//    - 开运算 Open：先腐蚀再膨胀 → 去掉白色小噪点（小于核的都被抹掉）
-//    - 闭运算 Close：先膨胀再腐蚀 → 填补白色区域内部小黑洞
+// 完整流水线（数物体项目的标准打法）：
+//   灰度化 → 二值化(Otsu) → 形态学清理(开闭) → 找轮廓 → 过滤计数
+//
+// FindContours 原理：在二值图上"沿着白色区块的边界行走"，
+// 把每个连通的白色区块的边界点按顺序串成一条闭合曲线（轮廓）。
+// 因为它是沿着"实心区块"的边缘走的，所以轮廓天然闭合、天然不断线
+// ——这正是第三课 Canny 苦苦追求的两点（NMS细线化+滞后连接）
+//
+// 关键认知：轮廓不是"边缘检测的另一种方法"，而是"区域分析的副产品"
+// ——先有面（二值区块），再沿着面的边界走出线（轮廓）
 // ============================================================
 
 // ---------- 1. 读取并灰度化 ----------
@@ -23,114 +24,86 @@ if (src.Empty())
 }
 Mat gray = new Mat();
 Cv2.CvtColor(src, gray, ColorConversionCodes.BGR2GRAY);
-int height = gray.Height;
-int width = gray.Width;
 
-// ---------- 2. 固定阈值 vs Otsu 自动阈值 ----------
-// 固定阈值 127：一半经验值，实际很难猜准（暗图/亮图差异巨大）
-Mat binFixed = new Mat();
-Cv2.Threshold(gray, binFixed, 127, 255, ThresholdTypes.Binary);
+// ---------- 2. Otsu 二值化（第四课） ----------
+Mat binary = new Mat();
+Cv2.Threshold(gray, binary, 127, 255, ThresholdTypes.Binary | ThresholdTypes.Otsu);
+Console.WriteLine("二值化完成");
 
-// Otsu：遍历所有可能阈值，找"前景/背景两类分得最开"的那个（类间方差最大）
-// 加 Otsu 标志后，阈值参数(127)会被忽略，由算法计算并返回
-Mat binOtsu = new Mat();
-double otsuValue = Cv2.Threshold(gray, binOtsu, 127, 255, ThresholdTypes.Binary | ThresholdTypes.Otsu);
-Console.WriteLine($"Otsu 自动选择的阈值: {otsuValue:F1}（对比我们瞎猜的127）");
-Console.WriteLine("观察:如果图片偏暗/偏亮，固定127会切得很离谱，Otsu永远切在两类之间");
-
-// ---------- 3. 结构元素：形态学的"卷积核" ----------
-// 与普通卷积核的区别：形状有意义（矩形/十字/椭圆），权重无意义（只看覆盖范围）
+// ---------- 3. 形态学清理（第四课）：噪点会被当成"物体"数出来！ ----------
+// 如果跳过这一步，FindContours 会把每个噪点都算一个"物体"（多计）
+// 先闭后开：填黑麻点 + 去白噪渣
 Mat kernel5 = Cv2.GetStructuringElement(MorphShapes.Rect, new Size(5, 5));
-// Rect: 实心 5x5 方块 | Cross: 十字形（只连上下左右）| Ellipse: 椭圆（边缘更圆润）
-// 核越大，腐蚀/膨胀的效果越猛
+Mat cleaned = new Mat();
+Cv2.MorphologyEx(binary, cleaned, MorphTypes.Close, kernel5);
+Cv2.MorphologyEx(cleaned, cleaned, MorphTypes.Open, kernel5);
+Console.WriteLine("形态学清理完成（不清理的话噪点会被数成物体）");
 
-// ---------- 4. 手写腐蚀：理解"邻域取最小" ----------
-// 腐蚀的规则：核覆盖的范围内只要有一个黑点(0)，中心就变黑
-// 效果：白色区域被"啃瘦"——细的白色笔画会直接消失
-Mat manualErode = new Mat(height, width, MatType.CV_8UC1, new Scalar(0));
-for (int y = 2; y < height - 2; y++)       // 5x5核，边界留2像素
+// ---------- 4. FindContours：核心一步 ----------
+// RetrievalModes.External: 只取最外层轮廓（物体内部的洞不要）
+//                          （若要嵌套轮廓/洞，用 RetrievalModes.Tree）
+// ContourApproximationModes.ApproxSimple: 压缩轮廓点（直线段只存端点，
+//                          省内存；要逐像素完整边界用 ApproxNone）
+// 返回 Point[][]: 每条轮廓是一个点数组
+Point[][] contours = Cv2.FindContoursAsArray(cleaned, RetrievalModes.External,
+                                             ContourApproximationModes.ApproxSimple);
+
+int total = contours.Length;
+Console.WriteLine($"找到 {total} 个轮廓（含噪点和碎块，需要过滤）");
+
+// ---------- 5. 轮廓过滤：面积门槛（计数项目的灵魂） ----------
+// 直接数轮廓数不靠谱：残余噪点、图像边角的碎块都会混进来。
+// 真实物体有"合理大小"，用面积卡门槛把假的踢掉。
+// 技巧：门槛取最大轮廓面积的 5%（自适应，不用手调绝对值）
+double maxArea = 0;
+for (int i = 0; i < total; i++)
 {
-    for (int x = 2; x < width - 2; x++)
+    double area = Cv2.ContourArea(contours[i]);
+    if (area > maxArea) maxArea = area;
+}
+double minValidArea = maxArea * 0.05; // 门槛 = 最大面积的5%，可调
+
+// ---------- 6. 在原图上标注通过过滤的"物体" ----------
+Mat result = src.Clone(); // 画在彩色原图上（不是二值图），观感更好
+int validCount = 0;
+for (int i = 0; i < total; i++)
+{
+    double area = Cv2.ContourArea(contours[i]);
+
+    if (area >= minValidArea)
     {
-        byte minVal = 255;
-        for (int dy = -2; dy <= 2; dy++)
-        {
-            for (int dx = -2; dx <= 2; dx++)
-            {
-                byte v = binOtsu.At<byte>(y + dy, x + dx);
-                if (v < minVal) minVal = v;     // 邻域找最小
-            }
-        }
-        manualErode.Set(y, x, minVal);
+        validCount++;
+        // 画轮廓线：绿色 2 像素宽
+        Cv2.DrawContours(result, contours, i, new Scalar(0, 255, 0), 2);
+
+        // 包围盒：把物体框起来（OpenCV坐标，Scalar顺序是BGR）
+        Rect box = Cv2.BoundingRect(contours[i]);
+        Cv2.Rectangle(result, box, new Scalar(0, 200, 255), 2);
+
+        // 标注编号和面积在物体上方
+        Cv2.PutText(result, $"#{validCount} area={area:F0}",
+                    new Point(box.X, box.Y - 5),
+                    HersheyFonts.HersheySimplex, 0.5,
+                    new Scalar(0, 255, 255), 1);
     }
 }
-Console.WriteLine("手写 5x5 腐蚀完成");
+Console.WriteLine($"过滤后有效物体数: {validCount}（门槛面积 {minValidArea:F0}）");
 
-// ---------- 5. 内置腐蚀/膨胀 ----------
-Mat eroded = new Mat();
-Cv2.Erode(binOtsu, eroded, kernel5);        // 白区缩小
-Mat dilated = new Mat();
-Cv2.Dilate(binOtsu, dilated, kernel5);      // 白区扩大
-Console.WriteLine("腐蚀/膨胀完成");
-
-// ---------- 6. 开运算与闭运算：形态学的实用主力 ----------
-// 开 = 先腐蚀再膨胀：腐蚀阶段小噪点直接消失（小于核的活不下来），
-//                      膨胀阶段把幸存的大区域恢复原大小 → 净效果=去白噪点
-Mat opened = new Mat();
-Cv2.MorphologyEx(binOtsu, opened, MorphTypes.Open, kernel5);
-
-// 闭 = 先膨胀再腐蚀：膨胀阶段白色小黑洞被填平，
-//                      腐蚀阶段恢复外形 → 净效果=填黑洞/愈合断裂
-Mat closed = new Mat();
-Cv2.MorphologyEx(binOtsu, closed, MorphTypes.Close, kernel5);
-Console.WriteLine("开/闭运算完成");
-
-// ---------- 7. 综合实验：给二值图撒噪点，用形态学清理 ----------
-// 模拟真实场景：二值化后总有杂点（第三课的椒盐噪声教训）
-Mat noisyBin = binOtsu.Clone();
-Random rand = new Random(42);
-for (int i = 0; i < 3000; i++)
-{
-    int y = rand.Next(height);
-    int x = rand.Next(width);
-    // 在黑白两色中随机取，制造"黑底白噪点 + 白区黑麻点"混合污染
-    noisyBin.Set(y, x, (byte)(rand.Next(2) * 255));
-}
-
-// 一步清理：先闭(填黑麻点)再开(去白噪点)
-Mat cleaned = new Mat();
-Cv2.MorphologyEx(noisyBin, cleaned, MorphTypes.Close, kernel5);
-Cv2.MorphologyEx(cleaned, cleaned, MorphTypes.Open, kernel5);
-Console.WriteLine("噪点清理完成");
-
-// ---------- 8. 形态学梯度：膨胀 - 腐蚀 = 区域轮廓 ----------
-// 膨胀后的白区比原大，腐蚀后的比原小，两者相减：
-// 中间重叠区抵消为0，只剩边缘一圈 → 直接得到"区域轮廓"
-Mat gradient = new Mat();
-Cv2.MorphologyEx(binOtsu, gradient, MorphTypes.Gradient, kernel5);
-Console.WriteLine("形态学梯度完成（对比第三课的边缘检测）");
-
-// ---------- 9. 展示全部结果 ----------
-Cv2.ImShow("1-灰度原图", gray);
-Cv2.ImShow("2-固定阈值127", binFixed);
-Cv2.ImShow($"3-Otsu自动阈值({otsuValue:F0})", binOtsu);
-Cv2.ImShow("4-手写5x5腐蚀", manualErode);
-Cv2.ImShow("5-内置腐蚀(白区缩小)", eroded);
-Cv2.ImShow("6-内置膨胀(白区扩大)", dilated);
-Cv2.ImShow("7-开运算(去白噪点)", opened);
-Cv2.ImShow("8-闭运算(填黑洞)", closed);
-Cv2.ImShow("9-污染的二值图", noisyBin);
-Cv2.ImShow("10-闭+开清理后", cleaned);
-Cv2.ImShow("11-形态学梯度(轮廓)", gradient);
+// ---------- 7. 展示流水线各阶段 ----------
+Cv2.ImShow("1-原图", src);
+Cv2.ImShow("2-Otsu二值化", binary);
+Cv2.ImShow("3-形态学清理后", cleaned);
+Cv2.ImShow($"4-计数结果: {validCount} 个物体", result);
 Cv2.WaitKey(0);
 Cv2.DestroyAllWindows();
 
 // ============================================================
 // 本课小结：
-// 1. Otsu 自动阈值告别手调127；ThresholdTypes 可按需反转
-// 2. 腐蚀=邻域取最小(白区缩)，膨胀=邻域取最大(白区胀)
-// 3. 开=先腐后胀(去白噪点)，闭=先胀后腐(填黑洞)
-// 4. 形态学梯度=膨胀-腐蚀，一步提取区域轮廓
-// 5. 形态学与卷积同框架：小核扫全图，只是"加权求和"换成"取最值"
-// 下一课预告：轮廓提取 FindContours —— 在干净的二值图上数物体
+// 1. 流水线: 灰度→Otsu二值→开闭清理→FindContours→面积过滤→计数
+// 2. FindContours 沿"实心区块边界"行走，轮廓天然闭合不断线
+// 3. External 模式只要外轮廓，Tree 模式含嵌套（洞的边界也算）
+// 4. 面积过滤是计数项目的灵魂：自适应门槛 = 最大轮廓×5%
+// 5. DrawContours/Rectangle/PutText 是结果可视化的三板斧
+// 本图(3.jpg)不是标准计数场景，效果取决于图片内容；
+// 练习建议：找一张"多个物品在纯色桌面"的照片效果最佳
 // ============================================================
