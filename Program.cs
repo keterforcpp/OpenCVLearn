@@ -1,31 +1,32 @@
 using OpenCvSharp;
 
 // ============================================================
-// 第六课：直方图与均衡化 —— 图像的"体检报告"
+// 第七课：HSV 颜色空间与颜色分割 —— 换一套坐标看颜色
 // ============================================================
-// 直方图 = 灰度值的"计票表"：统计每个灰度级(0~255)各有多少个像素
-//   横轴：灰度值 0(黑) → 255(白)
-//   纵轴：该灰度值的像素个数
+// BGR 的困境：三个数描述"蓝绿红配比"，人读不懂，光照一变全变
+//   例：纯红(0,0,255) 光照减半 → (0,0,128)，三个数全变了
+// HSV 的思路：把颜色拆成人能理解的三个独立问题
+//   H 色相(Hue)   —— "是什么颜色"（红橙黄绿青蓝紫转一圈 0~360°）
+//   S 饱和度(Sat) —— "颜色有多浓"（0=灰（没颜色），255=浓烈）
+//   V 明度(Val)   —— "有多亮"（0=黑，255=亮）
+// 核心价值：光照变化主要打击 V，H 基本不动 → 按颜色分割比按灰度分割抗光照
 //
-// 为什么它是"诊断工具"（本课最重要观念）：
-//   双峰直方图（暗的一堆 + 亮的一堆）→ Otsu 在谷底切一刀，切得干净
-//   单峰/宽峰（灰度挤在一起）       → 一刀切必失败 → 等第八课自适应阈值来救
-//
-// 均衡化 = 把挤在一起的灰度"拉开"：按累积分布函数 CDF 重映射灰度级
-//   挤在 [100,160] 的暗淡图 → 拉伸到接近 [0,255]，对比度大增
+// OpenCV 两大坑（本课主角）：
+//   1. 8U 图的 H 范围是 0~179（角度÷2 存进 byte），不是 0~255 也不是 0~360
+//   2. 红色横跨 H=0 两侧（350°~10°），InRange 抓红色要分两段再 OR 合并
 // ============================================================
 
-// ---------- 0. 数字实例：直方图就是"计票" ----------
-// 6 个像素，灰度值分别是 50,52,50,200,205,50：
-//   bin[50]=3  bin[52]=1  bin[200]=1  bin[205]=1，其余 252 个 bin 全是 0
-// 直方图统计只"计票"不做任何邻域运算——对照第二课卷积的滑窗加权求和，
-// 它连窗口都不需要，是像素级的纯统计
-int[] demo = { 50, 52, 50, 200, 205, 50 };
-int[] demoBins = new int[256];
-foreach (int v in demo) demoBins[v]++;
-Console.WriteLine($"数字实例: 6个像素中 灰度50出现{demoBins[50]}次, 52出现{demoBins[52]}次, 200出现{demoBins[200]}次");
+// ---------- 0. 数字实例：光照杀死灰度，杀不死色相 ----------
+// 纯红 BGR(0,0,255)：灰度 = 0.299×255 ≈ 76
+// 暗红 BGR(0,0,128)：灰度 = 0.299×128 ≈ 38 —— 灰度掉一半，"红"在灰度轴上搬家了
+// 换 HSV：两色的 H 都是 0°、S 都是 255，只有 V 从 255 掉到 128
+// → 按灰度找物体：光照一变阈值就废（第五课实战的问题一）
+//   按色相找物体：光照只动 V，掩膜基本不受影响 —— 本课的立足点
+Console.WriteLine("光照实验：纯红(0,0,255) vs 暗红(0,0,128)");
+Console.WriteLine("  灰度轴: 76 → 38（掉一半，物体和背景的相对位置全变）");
+Console.WriteLine("  HSV轴 : H=0→0, S=255→255（纹丝不动），仅 V=255→128\n");
 
-// ---------- 1. 读取并灰度化 ----------
+// ---------- 1. 读取 ----------
 Mat src = Cv2.ImRead(@"3.jpg", ImreadModes.Color);
 if (src.Empty())
 {
@@ -34,166 +35,187 @@ if (src.Empty())
 }
 Mat gray = new Mat();
 Cv2.CvtColor(src, gray, ColorConversionCodes.BGR2GRAY);
-Console.WriteLine($"\n图像尺寸 {gray.Width}x{gray.Height}, 总像素 {(long)gray.Width * gray.Height}");
 
-// ---------- 2. 手写直方图统计 ----------
-int[] bins = new int[256];            // 256 个票箱，数组下标 = 灰度值
-int h = gray.Height, w = gray.Width;  // 缓存属性到局部变量（P/Invoke 性能坑）
-for (int y = 0; y < h; y++)
+// ---------- 2. 手写 BGR→HSV 转换公式（几个样例色） ----------
+// 公式（先按数学定义算 0~360° 的角度，再缩放）：
+//   V = max(B,G,R)                          —— 最亮的通道就是明度
+//   S = (max-min)/max × 255                 —— 最大最小差越多，颜色越浓
+//   H = 谁最大看谁：R大→60°×(G-B)/diff；G大→60°×((B-R)/diff+2)；B大→60°×((R-G)/diff+4)
+//   （算出负数 +360°；OpenCV 存 byte，所以最后 ÷2 变 0~179）
+(string name, byte B, byte G, byte R)[] samples =
 {
-    for (int x = 0; x < w; x++)
+    ("纯红", 0, 0, 255), ("暗红", 0, 0, 128), ("绿", 0, 255, 0),
+    ("蓝", 255, 0, 0), ("黄", 0, 255, 255), ("灰", 128, 128, 128),
+};
+// 同一组颜色喂给官方 CvtColor，和手写公式对照
+Mat bgrRow = new Mat(samples.Length, 1, MatType.CV_8UC3, new Scalar(0, 0, 0));
+for (int i = 0; i < samples.Length; i++)
+    bgrRow.Set(i, 0, new Vec3b(samples[i].B, samples[i].G, samples[i].R));
+Mat hsvRow = new Mat();
+Cv2.CvtColor(bgrRow, hsvRow, ColorConversionCodes.BGR2HSV);
+
+Console.WriteLine("颜色  手写(H,S,V)   OpenCV(H,S,V)   H角度含义");
+for (int i = 0; i < samples.Length; i++)
+{
+    var m = Bgr2Hsv(samples[i].B, samples[i].G, samples[i].R);
+    Vec3b o = hsvRow.At<Vec3b>(i, 0);   // Item0=H, Item1=S, Item2=V（通道顺序）
+    Console.WriteLine($"{samples[i].name,-4} ({m.h,3},{m.s,3},{m.v,3})   ({o.Item0,3},{o.Item1,3},{o.Item2,3})   H={m.h * 2}°");
+}
+Console.WriteLine("（注意灰色的 H=0 毫无意义：S=0 时根本没有颜色可谈 → 过滤灰色靠 S 门槛）\n");
+
+// ---------- 3. 整图转 HSV + 拆通道看 ----------
+Mat hsv = new Mat();
+Cv2.CvtColor(src, hsv, ColorConversionCodes.BGR2HSV);
+Mat[] ch = Cv2.Split(hsv);   // ch[0]=H, ch[1]=S, ch[2]=V
+// H 通道坑：值域只有 0~179，直接显示偏暗 → ×1.4 拉到接近 0~255 才好看
+// （ConvertScaleAbs 就是第三课用过的"宽算窄显"工具：src×alpha+beta 再饱和回 8U）
+Mat hShow = new Mat();
+Cv2.ConvertScaleAbs(ch[0], hShow, 1.4);
+
+// ---------- 4. 自动选目标色：全图找 S 最高的像素 ----------
+// 思路：S 最高 = 全图最"彩"的像素，拿它的 H 当分割目标，任何图都能演示
+// （比写死"抓蓝色"通用；想抓别的颜色，把这里换成固定值即可）
+int hh = hsv.Height, ww = hsv.Width;   // 缓存属性（P/Invoke 老规矩）
+int bestS = -1, bx = 0, by = 0;
+for (int y = 0; y < hh; y++)
+{
+    for (int x = 0; x < ww; x++)
     {
-        bins[gray.At<byte>(y, x)]++;  // 灰度值直接当数组下标，一次计票
+        Vec3b p = hsv.At<Vec3b>(y, x);
+        if (p.Item2 > 40 && p.Item1 > bestS)   // V>40：太暗的像素不可信，跳过
+        {
+            bestS = p.Item1; bx = x; by = y;
+        }
     }
 }
-// 票箱用 int 够用：1920x1080=207万像素全落一个箱也只有 207万 << int上限21亿
-// 但下面凡是要做乘法的地方先转 long——int*int 会先溢出再提升，C/C++ 老坑 C# 一样有
+byte targetH = hsv.At<Vec3b>(by, bx).Item0;
+Console.WriteLine($"目标色: 像素({bx},{by}) H={targetH}(={targetH * 2}°) S={bestS} V={hsv.At<Vec3b>(by, bx).Item2}");
+Console.WriteLine("  H 速查: 0红 30黄 60绿 90青 120蓝 150紫（±15 内算同色）\n");
+if (bestS < 30)
+    Console.WriteLine("警告: 全图饱和度都很低（接近黑白照片），颜色分割效果有限\n");
 
-// ---------- 3. 内置 API：Cv2.CalcHist ----------
-// 参数逐个解释：
-//   channels = {0}: 统计第 0 通道（灰度图仅 1 通道；彩色图可选 B/G/R 之一）
-//   histSize = {256}: 每维箱子数，一值一箱
-//   ranges = [0,256): 取值范围——上界是开区间！写成 255 会丢掉所有灰度 255 的像素
-Mat histMat = new Mat();  // 输出: 256x1 的 CV_32FC1（坑：必须用 At<float> 读，不是 At<byte>）
-Cv2.CalcHist(new[] { gray }, new[] { 0 }, null, histMat, 1,
-             new[] { 256 }, new Rangef[] { new Rangef(0, 256) });
+// ---------- 5. Cv2.InRange + 手写对照验证（第六课的验证套路） ----------
+// InRange: 三个通道同时落在 [lower, upper] 内 → 输出 255（白），否则 0（黑）
+// 上下界都是闭区间。Scalar 顺序 = HSV 顺序
+int tol = 10;                                          // H 容差：±10（约±20°）
+int hLo = Math.Max(0, targetH - tol), hHi = Math.Min(179, targetH + tol);
+int sLo = 60;   // S 门槛：低于 60 = 接近灰色，H 不可信，直接排除
+int vLo = 40;   // V 门槛：太暗的像素噪声大，排除
+Mat mask = new Mat();
+Cv2.InRange(hsv, new Scalar(hLo, sLo, vLo), new Scalar(hHi, 255, 255), mask);
 
-// 验证手写与内置结果完全一致
-long diffCount = 0;
-for (int i = 0; i < 256; i++)
+// 手写版：InRange 的黑盒里就是这段逐像素三通道比较
+Mat maskManual = new Mat(hh, ww, MatType.CV_8UC1, new Scalar(0));  // new Mat 不清零老坑
+for (int y = 0; y < hh; y++)
 {
-    diffCount += Math.Abs((long)histMat.At<float>(i, 0) - bins[i]);
+    for (int x = 0; x < ww; x++)
+    {
+        Vec3b p = hsv.At<Vec3b>(y, x);
+        bool inside = p.Item0 >= hLo && p.Item0 <= hHi &&
+                      p.Item1 >= sLo && p.Item2 >= vLo;
+        maskManual.At<byte>(y, x) = (byte)(inside ? 255 : 0);
+    }
 }
-Console.WriteLine($"手写 vs CalcHist 总差 = {diffCount}（应为 0：计数值存 float 无精度损失）");
-
-// ---------- 4. 把直方图画成图（诊断报告可视化） ----------
-Mat histImg = DrawHist(bins, "Gray Histogram");
-Console.WriteLine("\n看窗口2的直方图：峰在哪里、挤不挤，直接决定 Otsu 的生死");
-
-// ---------- 5. 直方图诊断：预测 Otsu 的成败 ----------
-// 复用第 2 节的 bins 算四段占比（不用重新扫图——计票表一次算好反复用）
-long total = (long)h * w;
-long c1 = 0, c2 = 0, c3 = 0;
-for (int i = 0; i < 64; i++) c1 += bins[i];
-for (int i = 64; i < 128; i++) c2 += bins[i];
-for (int i = 128; i < 192; i++) c3 += bins[i];
-long c4 = total - c1 - c2 - c3;
-Console.WriteLine($"灰度分布: 暗部[0,63]={c1 * 100.0 / total:F1}%  中暗[64,127]={c2 * 100.0 / total:F1}%  "
-                  + $"中亮[128,191]={c3 * 100.0 / total:F1}%  亮部[192,255]={c4 * 100.0 / total:F1}%");
-
-// 回收第四课：让 Otsu 自己报阈值（只要这个数，二值结果图不用）
-double otsuTh = Cv2.Threshold(gray, new Mat(), 0, 255, ThresholdTypes.Binary | ThresholdTypes.Otsu);
-Console.WriteLine($"Otsu 阈值 = {otsuTh:F0}");
-// 诊断口诀：
-//   双峰明显、谷底深    → 全局阈值切得干净（第五课流水线成立的前提）
-//   单峰 / 宽峰 / 挤中间 → 一刀下去必丢细节 → 第八课自适应阈值正面解决
-
-// ---------- 6. 均衡化：手写 CDF 重映射 vs Cv2.EqualizeHist ----------
-// 原理（数字实例）：4 个像素 {50,50,100,150}，CDF 为累积占比
-//   CDF(50)=2/4=0.5  CDF(100)=3/4=0.75  CDF(150)=4/4=1.0
-//   重映射（简化式 newVal = CDF*255）：
-//     50→128   100→191   150→255
-//   原来挤在 [50,150] 窄区间 → 拉开到 [128,255]：间隔从 50 变 63，对比度变大
-//   这就是均衡化的全部秘密：按 CDF 拉伸灰度间距，占像素多的灰度段分到更宽的区间
-//
-// 完整公式还要减 cdfMin（第一个非零箱的 CDF），保证最暗的有效灰度映射到 0
-
-// 手写：先建 256 项查找表 LUT，再整表套用——"先算好答案再查表"的工程套路
-long cdf = 0, cdfMin = -1;
-byte[] lut = new byte[256];
-for (int i = 0; i < 256; i++)
-{
-    cdf += bins[i];
-    if (cdfMin < 0 && bins[i] > 0) cdfMin = cdf;  // 第一个非零箱的累积值
-    if (cdfMin >= 0)  // 比第一个非零灰度还暗的值图中不存在，LUT 留 0 即可
-        lut[i] = (byte)Math.Round((cdf - cdfMin) / (double)(total - cdfMin) * 255,
-                                  MidpointRounding.AwayFromZero);  // 对齐 C 的四舍五入
-}
-Mat lutMat = new Mat(1, 256, MatType.CV_8UC1);
-for (int i = 0; i < 256; i++) lutMat.Set(0, i, lut[i]);
-Mat eqManual = new Mat();
-Cv2.LUT(gray, lutMat, eqManual);  // LUT 整块查表，比手写逐像素循环快
-
-// 内置 API（只收 8UC1 单通道，传彩色图直接抛异常——常见坑）
-Mat eq = new Mat();
-Cv2.EqualizeHist(gray, eq);
-
-// 对照实验：两者应逐像素一致（OpenCV 内部就是这套 CDF 公式）
 Mat diffMat = new Mat();
-Cv2.Absdiff(eqManual, eq, diffMat);
+Cv2.Absdiff(mask, maskManual, diffMat);
 Cv2.MinMaxIdx(diffMat, out _, out double maxDiff);
-Console.WriteLine($"\n手写 CDF 均衡化 vs EqualizeHist 最大像素差 = {maxDiff}（应为 0）");
+Console.WriteLine($"手写 InRange vs Cv2.InRange 最大像素差 = {maxDiff}（应为 0）");
 
-// 均衡化后的直方图：注意不是"完美平坦"！
-// 常见误解：均衡化 = 直方图变均匀。实际只能"拉开间距"——
-// 像素仍集中在原来那几个灰度附近，只是彼此隔得更开，柱子间出现空隙
-int[] binsEq = CountHist(eq);
-Mat histEqImg = DrawHist(binsEq, "After Equalization");
+// ---------- 6. 完整流水线：mask → 形态学 → 轮廓 → 计数（回收第四五课） ----------
+// 红色跨界补刀：红色在 H=0 两侧（350°~10°），若目标色贴边，主 mask 外再补一段
+if (targetH - tol < 0)        // 目标贴 0 这一侧 → 补 179 那一侧
+{
+    Mat extra = new Mat();
+    Cv2.InRange(hsv, new Scalar(180 + targetH - tol, sLo, vLo),
+                     new Scalar(179, 255, 255), extra);
+    Cv2.BitwiseOr(mask, extra, mask);   // 两个掩膜求并集
+}
+else if (targetH + tol > 179) // 目标贴 179 这一侧 → 补 0 那一侧
+{
+    Mat extra = new Mat();
+    Cv2.InRange(hsv, new Scalar(0, sLo, vLo),
+                     new Scalar(targetH + tol - 180, 255, 255), extra);
+    Cv2.BitwiseOr(mask, extra, mask);
+}
 
-// ---------- 7. CLAHE：限制对比度自适应均衡 ----------
-// 全局均衡化的问题：整张图共用一张映射表，占比大的暗部被强行拉亮
-//   → 暗部噪声跟着放大、天空等亮部过曝（看窗口3的暗处颗粒感）
-// CLAHE 思路：
-//   1) 把图切成 8x8 块小瓷砖，每块独立均衡——各管各的亮度底色
-//   2) clipLimit 给每块直方图"限高"：超高的峰先削顶，削下来的票均分给别的箱
-//      → 单个灰度值不能霸占映射区间，噪声放大被限制住
-Mat clahe2 = new Mat(), clahe6 = new Mat();
-using (CLAHE claA = Cv2.CreateCLAHE(2.0, new Size(8, 8))) claA.Apply(gray, clahe2);
-using (CLAHE claB = Cv2.CreateCLAHE(6.0, new Size(8, 8))) claB.Apply(gray, clahe6);
-// 参数实验：clipLimit 越大对比度拉得越狠，也越接近全局均衡化的"用力过猛"
-// 把 2.0 / 6.0 / 20.0 各跑一遍，找暗部细节与噪声之间的平衡点
+Mat kernel5 = Cv2.GetStructuringElement(MorphShapes.Ellipse, new Size(5, 5));
+Cv2.MorphologyEx(mask, mask, MorphTypes.Open, kernel5);   // 开运算去白噪渣（第四课）
 
-// ---------- 8. 展示 ----------
-Cv2.ImShow("1-原图(灰度)", gray);
-Cv2.ImShow("2-直方图诊断", histImg);
-Cv2.ImShow("3-全局均衡化", eq);
-Cv2.ImShow("4-均衡化后直方图", histEqImg);
-Cv2.ImShow("5-CLAHE clip=2(温和)", clahe2);
-Cv2.ImShow("6-CLAHE clip=6(激进)", clahe6);
+Point[] [] contours = Cv2.FindContoursAsArray(mask, RetrievalModes.External,
+                                              ContourApproximationModes.ApproxSimple);
+double maxArea = 0;
+for (int i = 0; i < contours.Length; i++)
+{
+    double a = Cv2.ContourArea(contours[i]);
+    if (a > maxArea) maxArea = a;
+}
+Mat result = src.Clone();
+int count = 0;
+for (int i = 0; i < contours.Length; i++)
+{
+    if (Cv2.ContourArea(contours[i]) >= maxArea * 0.05)   // 相对面积门槛（第五课）
+    {
+        count++;
+        Rect box = Cv2.BoundingRect(contours[i]);
+        Cv2.DrawContours(result, contours, i, new Scalar(0, 255, 0), 2);
+        Cv2.PutText(result, $"#{count}", new Point(box.X, box.Y - 5),
+                    HersheyFonts.HersheySimplex, 0.7, new Scalar(0, 255, 0), 2);
+    }
+}
+Console.WriteLine($"\nHSV 分割流水线: 找到 {contours.Length} 个轮廓，过滤后 {count} 个目标色区域");
+
+// ---------- 7. 对照实验一：灰度 Otsu vs HSV 颜色分割 ----------
+// 同一张图两条路：灰度轴一刀切 vs 色相轴按区间抓
+// 看窗口5和窗口6谁把目标抠得干净 —— 灰度分不开但颜色分得开的场景，差距巨大
+Mat otsuMask = new Mat();
+Cv2.Threshold(gray, otsuMask, 0, 255, ThresholdTypes.Binary | ThresholdTypes.Otsu);
+Console.WriteLine("对照: 窗口5(Otsu灰度掩膜) vs 窗口6(HSV颜色掩膜) —— 谁的目标更完整、背景更干净？");
+
+// ---------- 8. 参数实验二：H 容差 ±10 vs ±30 ----------
+// 容差小：抠得纯但可能漏（目标颜色稍有深浅就漏抓）
+// 容差大：抓得全但可能误（把相邻颜色也抓进来）
+int wLo = Math.Max(0, targetH - 30), wHi = Math.Min(179, targetH + 30);
+Mat maskWide = new Mat();
+Cv2.InRange(hsv, new Scalar(wLo, sLo, vLo), new Scalar(wHi, 255, 255), maskWide);
+// （红色目标跨界时此处同样需要第 6 节的补刀，演示从简）
+Console.WriteLine("参数实验: 窗口6(H±10) vs 窗口7(H±30) —— 纯度与完整度的权衡\n");
+
+// ---------- 9. 展示 ----------
+Cv2.ImShow("1-原图", src);
+Cv2.ImShow("2-H色相通道(×1.4显示)", hShow);
+Cv2.ImShow("3-S饱和度通道", ch[1]);
+Cv2.ImShow("4-V明度通道", ch[2]);
+Cv2.ImShow("5-对照-灰度Otsu掩膜", otsuMask);
+Cv2.ImShow($"6-HSV掩膜 H={targetH}±10", mask);
+Cv2.ImShow("7-HSV掩膜 H±30", maskWide);
+Cv2.ImShow($"8-计数结果: {count} 个目标区域", result);
 Cv2.WaitKey(0);
 Cv2.DestroyAllWindows();
 
 // ============================================================
 // 本课小结：
-// 1. 直方图 = 每个灰度值的计票表，纯统计无邻域；CalcHist 上界 256 开区间
-// 2. 直方图是诊断工具：双峰→Otsu 可切；单峰/宽峰→全局阈值必失败（第八课伏笔）
-// 3. 均衡化 = 按 CDF 重映射灰度：像素多的灰度段分到更宽的区间，拉对比度
-// 4. 均衡化后直方图不是平坦的，只是"拉开间距"——柱间有空隙才对
-// 5. 全局均衡化放大暗部噪声 → CLAHE 分块均衡 + clipLimit 限高，兼顾细节与噪声
-// 练习建议：换一张逆光/雾蒙蒙的低对比度照片跑本课代码，均衡化效果会更震撼
+// 1. HSV 把颜色拆成 H(是什么色) S(多浓) V(多亮)，光照变化主要打击 V
+// 2. OpenCV 8U 图的 H 是 0~179（角度÷2）；红色横跨 0 两侧要两段 InRange 再 OR
+// 3. InRange 三通道同落区间→白，输出 mask 直接接第五课流水线（形态学→轮廓→计数）
+// 4. S 门槛过滤灰色像素（S 低时 H 无意义）、V 门槛过滤暗部噪声
+// 5. 生成二值图的三条路会师：阈值切割(第四课)、边缘(第三课)、颜色分割(本课)
+// 6. H 容差是纯度与完整度的权衡：±10 纯、±30 全，按场景调
+// 练习建议：把第 4 节目标色换成图中第二种颜色，再看 ±10/±30 的差异
 // ============================================================
 
 // ---------- 工具函数 ----------
-// 统计一张 8UC1 图的直方图（第 2 节逻辑的复用封装）
-static int[] CountHist(Mat img)
+// 手写 BGR→HSV（8U 版）：返回 OpenCV 刻度（H:0~179, S/V:0~255）
+static (int h, int s, int v) Bgr2Hsv(byte B, byte G, byte R)
 {
-    int[] b = new int[256];
-    int hh = img.Height, ww = img.Width;
-    for (int y = 0; y < hh; y++)
-        for (int x = 0; x < ww; x++)
-            b[img.At<byte>(y, x)]++;
-    return b;
-}
-
-// 把 256 个计票箱画成柱状图（宽 512 = 每箱 2 像素；高 300 = 底部留 30 写刻度）
-static Mat DrawHist(int[] b, string title)
-{
-    // 坑：new Mat(高,宽,类型) 不带 Scalar 的重载不清零！必须显式给初值
-    Mat canvas = new Mat(300, 512, MatType.CV_8UC3, new Scalar(40, 40, 40));
-    int maxBin = b.Max();
-    if (maxBin == 0) return canvas;
-    for (int i = 0; i < 256; i++)
-    {
-        // (long) 先转再乘：b[i] 可达百万级，先乘 270 会逼近 int 上限
-        int barH = (int)((long)b[i] * (300 - 40) / maxBin);
-        Cv2.Rectangle(canvas, new Rect(i * 2, 300 - 30 - barH, 2, barH),
-                      new Scalar(200, 200, 200), -1);  // 灰色实心柱，-1=填充
-    }
-    // 刻度：0(黑) — 128 — 255(白)，帮助定位峰偏暗侧还是亮侧
-    // 注意：PutText 的 Hershey 字体不支持中文，图内文字只能用 ASCII
-    Cv2.PutText(canvas, "0", new Point(2, 295), HersheyFonts.HersheySimplex, 0.4, new Scalar(180, 180, 180), 1);
-    Cv2.PutText(canvas, "128", new Point(248, 295), HersheyFonts.HersheySimplex, 0.4, new Scalar(180, 180, 180), 1);
-    Cv2.PutText(canvas, "255", new Point(488, 295), HersheyFonts.HersheySimplex, 0.4, new Scalar(180, 180, 180), 1);
-    Cv2.PutText(canvas, title, new Point(5, 20), HersheyFonts.HersheySimplex, 0.5, new Scalar(0, 255, 255), 1);
-    return canvas;
+    int max = Math.Max(B, Math.Max(G, R));
+    int min = Math.Min(B, Math.Min(G, R));
+    int v = max;
+    int s = max == 0 ? 0 : (max - min) * 255 / max;   // 全黑像素 S 定义为 0，防除零
+    double hDeg;
+    if (max == min) hDeg = 0;                          // 灰色无色相，规定为 0
+    else if (max == R) hDeg = 60.0 * (G - B) / (max - min);        // 红区段，可为负
+    else if (max == G) hDeg = 60.0 * ((B - R) / (double)(max - min) + 2); // 绿区段
+    else              hDeg = 60.0 * ((R - G) / (double)(max - min) + 4);  // 蓝区段
+    if (hDeg < 0) hDeg += 360;                         // 红区段负角拉回正半圈
+    return ((int)Math.Round(hDeg / 2), s, v);          // ÷2 存进 0~179
 }
