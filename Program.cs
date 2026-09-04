@@ -1,221 +1,247 @@
 using OpenCvSharp;
 
 // ============================================================
-// 第八课：自适应阈值与光照不均 —— 让阈值跟着亮度走
+// 第九课：距离变换与分水岭 —— 粘连目标的分割与计数
 // ============================================================
-// 第五课实战的病根：光照不均时同一物体半亮半暗，
-// 全局阈值（含 Otsu）一刀切必然顾此失彼 —— 本课正面解决
+// 第五课实战问题二：物体粘连 → FindContours 把两个数成一个
+// 第四课伏笔回收："腐蚀分不开的粘连，上分水岭"
 //
-// 核心思想：全局阈值假设"全图共用一个标准"，光照不均打破假设
-//   → 对策：每个像素的阈值 = 它周围邻域的平均亮度 − C
-//     亮的区域标准自动高、暗的区域标准自动低 —— 阈值跟着光照走
-//
-// 两条技术路线：
-//   路线一 AdaptiveThreshold：直接算局部阈值（本课主角，手写+API+验证）
-//   路线二 平场校正：大核模糊估计光照场 → 除掉光照 → 还原均匀图再 Otsu
+// 核心思想（地质比喻）：
+//   距离变换: 二值图上每个白点到最近黑边的距离
+//     → 物体中心离边界最远 → 距离图上每个物体一座"山丘"
+//     → 两个粘连物体 = 两座山共用一条坡（粘连颈是山脊上的鞍部）
+//   分水岭: 从每个山丘顶部(种子)向外"漫水"
+//     → 两边的水在鞍部相遇 → 相遇线就是切割线
+//   一句话: 独立物体各有"最胖处"，从最胖处向外认领地盘，
+//           接壤处自然就是分界 —— 这正是人眼分辨粘连物体的方式
 // ============================================================
 
-// ---------- 0. 数字实例：一刀切为什么两头都错 ----------
-// 设全局阈值 = 120（Otsu 在光照不均图上算出的"折中值"）
-//   亮区（灯照到）: 背景 220, 物体 150 → 都 >120 → 全白，物体融进背景
-//   暗区（阴影里）: 背景  80, 物体  30 → 都 <120 → 全黑，物体又融进背景
-//   → 一刀切在图的两端各错一次（第五课实战的"融成一片"）
-// 自适应判决（阈值 = 邻域均值 − C, C=10）:
-//   亮区邻域均值≈215 → 当地阈值 205: 背景 220>205 白, 物体 150<205 黑 → 分开
-//   暗区邻域均值≈ 75 → 当地阈值  65: 背景  80> 65 白, 物体  30< 65 黑 → 分开
-//   → "比当地平均亮多少"这个标准，在亮区暗区同时成立
-Console.WriteLine("全局阈值 120: 亮区(220,150)全白融合, 暗区(80,30)全黑融合");
-Console.WriteLine("自适应阈值(均值-10): 亮区判 205, 暗区判 65, 两边都分开\n");
+// ---------- 0. 数字实例：距离变换就是"量到边有多远" ----------
+// 一行二值图（0=黑边, 1=物体）:  0 0 1 1 1 1 1 0 0
+// 每个白点到最近黑边的距离:     0 0 1 2 3 2 1 0 0
+//                                     ↑
+//                          离两边一样远的位置 = 物体"中线"
+// 单个物体 → 一座单峰山；两个粘连物体 → 双峰，鞍部在粘连颈
+Console.WriteLine("距离变换: 每个白点标上'到最近黑边的距离'");
+Console.WriteLine("例: [0 0 1 1 1 1 1 0 0] → [0 0 1 2 3 2 1 0 0]（峰在中线）\n");
 
-// ---------- 1. 读取并灰度化 ----------
-Mat src = Cv2.ImRead(@"3.jpg", ImreadModes.Color);
-if (src.Empty())
+// ---------- 1. 合成粘连图：两个重叠的圆 ----------
+// 用合成图而非照片：粘连程度可控，保证演示效果稳定
+// 两圆 r=70、圆心距 100 < 140 → 重叠粘连，FindContours 只见 1 个轮廓
+Mat mask = new Mat(400, 500, MatType.CV_8UC1, new Scalar(0));
+Cv2.Circle(mask, new Point(200, 200), 70, new Scalar(255), -1);
+Cv2.Circle(mask, new Point(300, 200), 70, new Scalar(255), -1);
+int h = mask.Height, w = mask.Width;
+Console.WriteLine($"合成粘连图: 两圆 r=70, 圆心距 100（重叠 40 像素）");
+
+// ---------- 2. 病理展示：老流水线计数 = 1 ----------
+Point[][] contours = Cv2.FindContoursAsArray(mask, RetrievalModes.External,
+                                             ContourApproximationModes.ApproxSimple);
+Console.WriteLine($"\n老流水线(FindContours): 数出 {contours.Length} 个物体（真值 2）← 病");
+
+// 腐蚀能救吗？（第四课的老工具）
+// 粘连颈宽约 98 像素，腐蚀每次只把边界往里吃 ~2 像素
+//   → 吃到颈断开需要 ~25 次，但那时圆(r=70)也被吃得只剩壳
+//   → "腐蚀分不开，分开时物体也没了" —— 第四课埋的伏笔，本课验证
+Mat eroded5 = new Mat();
+Mat kernel5 = Cv2.GetStructuringElement(MorphShapes.Ellipse, new Size(5, 5));
+Cv2.Erode(mask, eroded5, kernel5, null, 5);   // 迭代 5 次
+Point[][] c5 = Cv2.FindContoursAsArray(eroded5, RetrievalModes.External,
+                                       ContourApproximationModes.ApproxSimple);
+Console.WriteLine($"腐蚀 5 次后: 仍 {c5.Length} 个（颈太肥，吃不动）");
+Console.WriteLine("结论: 粘连靠腐蚀无解 → 需要分水岭");
+
+// ---------- 3. 手写距离变换（小图暴力版）vs API 对照 ----------
+// 原理暴力版: 每个白点，扫描全图找最近的黑点，算欧氏距离
+//   O(N²) 只在演示小图上可行 —— 大图必须用 OpenCV 的两遍扫描法
+// 小图 14x6，两个粘连的矩形块
+Mat small = new Mat(6, 14, MatType.CV_8UC1, new Scalar(0));
+Cv2.Rectangle(small, new Rect(2, 1, 4, 4), new Scalar(255), -1);
+Cv2.Rectangle(small, new Rect(8, 1, 4, 4), new Scalar(255), -1);
+// 注意: 两块横向间隔 2 像素、不粘连 → 距离图应是两座独立小山
+if (!small.GetArray(out byte[] sp))
 {
-    Console.WriteLine("读取失败：请确认 3.jpg 在项目输出目录（bin/Debug/net8.0）中");
+    Console.WriteLine("GetArray 失败");
     return;
 }
-Mat gray = new Mat();
-Cv2.CvtColor(src, gray, ColorConversionCodes.BGR2GRAY);
-int h = gray.Height, w = gray.Width;   // 缓存属性（P/Invoke 老规矩）
-
-// ---------- 2. 人造光照不均：左亮右暗渐变 ----------
-// 光照的物理模型是"乘性"的：光照减弱 k 倍 → 拍到的亮度同乘 k
-// 用逐列系数 1.0 → 0.35 乘整图，模拟"左边有灯、右边背光"
-// 性能技巧：GetArray 把整个 Mat 一次性拷进 C# 托管数组，循环里纯内存操作
-//   —— 比循环内逐次 At<byte>（每次都跨 P/Invoke 边界）快百倍
-if (!gray.GetArray(out byte[] px))
+int sh = small.Height, sw = small.Width;
+float[,] manual = new float[sh, sw];
+for (int y = 0; y < sh; y++)
 {
-    Console.WriteLine("GetArray 失败：gray 不是 8UC1");
-    return;
-}
-byte[] pxUneven = new byte[px.Length];
-for (int y = 0; y < h; y++)
-{
-    int row = y * w;
-    for (int x = 0; x < w; x++)
+    for (int x = 0; x < sw; x++)
     {
-        double k = 1.0 - 0.65 * x / (w - 1);   // 列位置 → 光照系数
-        pxUneven[row + x] = (byte)Math.Round(px[row + x] * k);
+        if (sp[y * sw + x] == 0) { manual[y, x] = 0; continue; }
+        float best = float.MaxValue;
+        for (int yy = 0; yy < sh; yy++)          // 暴力: 扫全图找最近黑点
+            for (int xx = 0; xx < sw; xx++)
+            {
+                if (sp[yy * sw + xx] != 0) continue;
+                float d = MathF.Sqrt((yy - y) * (yy - y) + (xx - x) * (xx - x));
+                if (d < best) best = d;
+            }
+        manual[y, x] = best;
     }
 }
-Mat uneven = new Mat(h, w, MatType.CV_8UC1, new Scalar(0));
-uneven.SetArray(pxUneven);                     // 托管数组一次性写回 Mat
-Console.WriteLine("已构造光照不均图：左端亮度 100%，右端 35%");
+Mat distSmall = new Mat();
+Cv2.DistanceTransform(small, distSmall, DistanceTypes.L2, DistanceTransformMasks.Mask3);
+float maxErr = 0;
+for (int y = 0; y < sh; y++)
+    for (int x = 0; x < sw; x++)
+    {
+        float err = MathF.Abs(manual[y, x] - distSmall.At<float>(y, x));
+        if (err > maxErr) maxErr = err;
+    }
+Console.WriteLine($"\n手写暴力距离变换 vs Cv2.DistanceTransform 最大差 = {maxErr:F3}（应≈0）");
+Console.WriteLine("距离图(手写, 每行14列):");
+for (int y = 0; y < sh; y++)
+{
+    Console.Write("  ");
+    for (int x = 0; x < sw; x++) Console.Write($"{manual[y, x],4:F0}");
+    Console.WriteLine();
+}
+Console.WriteLine("→ 两座小山各一个峰 = 两个独立物体（若粘连则鞍部相连）\n");
 
-// ---------- 3. 病理展示：全局 Otsu 的失败现场 ----------
-Mat otsuFail = new Mat();
-double otsuTh = Cv2.Threshold(uneven, otsuFail, 0, 255,
-                              ThresholdTypes.Binary | ThresholdTypes.Otsu);
-Console.WriteLine($"\n全局 Otsu 阈值 = {otsuTh:F0}（折中值：照顾亮区就丢暗区，反之亦然）");
-Console.WriteLine("看窗口2: 一刀切的结果 —— 亮半边糊成一片白, 暗半边糊成一片黑");
+// ---------- 4. 大图距离变换 ----------
+// 输入 8UC1 二值图, 输出 32FC1 距离图（At<float> 读！）
+// DistL2 = 欧氏距离（还有 DistL1 曼哈顿/ DistC 棋盘等近似，L2 最准）
+Mat dist = new Mat();
+Cv2.DistanceTransform(mask, dist, DistanceTypes.L2, DistanceTransformMasks.Mask3);
+Cv2.MinMaxIdx(dist, out _, out double maxDist);
+Console.WriteLine($"大图距离变换: 最大距离 = {maxDist:F1}（≈圆半径，山最高的地方）");
+// 显示: 32F 距离图归一化到 0~255 才能看（越亮=离边越远=越靠物体中心）
+Mat distShow = new Mat();
+Cv2.Normalize(dist, distShow, 0, 255, NormTypes.MinMax);
+Mat dist8u = new Mat();
+Cv2.ConvertScaleAbs(distShow, dist8u);
 
-// ---------- 4. 手写自适应阈值（积分图 + 邻域均值 − C） ----------
-// 算法：对每个像素取 blockSize×blockSize 邻域的均值 mean，
-//       判决 gray > mean − C ? 255 : 0
-// 难点在性能：若每个像素都重扫一遍窗口（51×51=2601 格），
-//   100 万像素 × 2601 = 26 亿次加法 —— 不可行
-// 积分图（summed-area table）把它降到 O(1)/像素：
-//   sum(y,x) = (0,0)~(y,x) 矩形的像素总和，构建一遍 O(N)
-//   之后任意矩形和 = 4 个角各查一次加减：
-//     矩形(y1..y2, x1..x2)和 = S(y2+1,x2+1) − S(y1,x2+1) − S(y2+1,x1) + S(y1,x1)
-//   数字实例: 图 [1 2]   积分图 [0 0  0 ]
-//                  [3 4]         [0 1  3 ]
-//                                [0 4 10]
-//     全图和 = 10−0−0+0 = 10 = 1+2+3+4 ✓；右下单格 = 10−3−4+1 = 4 ✓
-const int BlockSize = 51;   // 邻域边长（必须奇数，中心才唯一）
-const double CC = 10;       // 从均值中减去的余量（判决余量，滤掉缓变浮动）
-Mat adaptManual = AdaptiveMeanManual(uneven, BlockSize, CC);
-Console.WriteLine("\n手写自适应阈值完成（积分图加速，全图线性扫描）");
+// ---------- 5. 构造种子和 markers（分水岭的"发令枪"） ----------
+// 种子 = 距离图的高地（> maxDist×0.5）→ 每个物体"最胖处"的一小块
+// 相对阈值（第五课老规矩）: 门槛跟最大距离走，不用手调绝对值
+Mat seedsF = new Mat();
+Cv2.Threshold(dist, seedsF, maxDist * 0.5, 255, ThresholdTypes.Binary);
+Mat seeds = new Mat();
+seedsF.ConvertTo(seeds, MatType.CV_8UC1);
+Point[][] seedContours = Cv2.FindContoursAsArray(seeds, RetrievalModes.External,
+                                                 ContourApproximationModes.ApproxSimple);
+Console.WriteLine($"\n种子提取: 距离 > {maxDist * 0.5:F0} 的高地 → {seedContours.Length} 颗种子（每物体一颗）");
 
-// ---------- 5. Cv2.AdaptiveThreshold + 内部区域对照验证 ----------
-// 参数逐个：
-//   maxValue=255: 命中时输出的值
-//   MeanC    : 局部阈值 = 邻域算术均值 − C
-//   GaussianC: 邻域高斯加权均值 − C（近处像素权重大，阈值更平滑）
-//   Binary   : 高于阈值→白（此 API 只支持 Binary/BinaryInv 两种）
-//   blockSize: 邻域边长，必须奇数
-//   C=10     : 判决标准是"比当地平均亮 10 以上"才算目标
-Mat adaptMean = new Mat();
-Cv2.AdaptiveThreshold(uneven, adaptMean, 255, AdaptiveThresholdTypes.MeanC,
-                      ThresholdTypes.Binary, BlockSize, CC);
-Mat adaptGauss = new Mat();
-Cv2.AdaptiveThreshold(uneven, adaptGauss, 255, AdaptiveThresholdTypes.GaussianC,
-                      ThresholdTypes.Binary, BlockSize, CC);
+// markers: 32SC1 整数标签图（分水岭的输入输出）
+//   0     = 未知区域（水还没漫到，交给算法判决）
+//   1     = 背景（图像边框一圈 —— 背景也需要种子，否则会被物体吞并）
+//   2,3.. = 各物体的种子（DrawContours 填充写编号）
+Mat markers = new Mat(h, w, MatType.CV_32SC1, new Scalar(0));   // 不清零老坑: 显式给 0
+Cv2.Rectangle(markers, new Rect(0, 0, w, h), new Scalar(1), 3); // 边框线标背景=1
+for (int i = 0; i < seedContours.Length; i++)
+    Cv2.DrawContours(markers, seedContours, i, new Scalar(i + 2), -1);  // 种子区标 2,3..
 
-// 对照验证（第六七课套路）：手写 vs API 应逐像素一致
-// 细节：图像边界一圈（宽 blockSize/2）两者语义不同 ——
-//   OpenCV 用"复制边缘像素"补窗口（分母固定 blockSize²）
-//   手写版只统计界内像素（分母随窗口缩小）
-//   → 只验证"窗口不出界"的内部区域；边界差异属预期，不影响主体
-int r = BlockSize / 2;
-Rect inner = new Rect(r, r, w - 2 * r, h - 2 * r);
-Mat diffMat = new Mat();
-Cv2.Absdiff(adaptMean.SubMat(inner), adaptManual.SubMat(inner), diffMat);
-Cv2.MinMaxIdx(diffMat, out _, out double maxDiff);
-Console.WriteLine($"手写 vs AdaptiveThreshold(MeanC) 内部区域最大像素差 = {maxDiff}（应为 0）");
+// ---------- 6. 分水岭：漫水、相遇、划界 ----------
+Mat maskBgr = new Mat();
+Cv2.CvtColor(mask, maskBgr, ColorConversionCodes.GRAY2BGR);   // Watershed 要 8UC3 输入
+Cv2.Watershed(maskBgr, markers);   // markers 原地改写: 每像素=归属编号, 边界=-1
 
-// ---------- 6. 参数实验：blockSize 11 vs 51 vs 101 ----------
-// blockSize 决定"局部"有多大：
-//   11  : 窗口小 → 阈值紧贴局部细节 → 小噪声也能抬高当地均值 → mask 偏碎
-//   51  : 适中 → 阈值跟光照走、不被小细节带偏
-//   101 : 窗口大 → 邻域均值越来越像全图均值 → 趋近"全局均值−C"的固定阈值
-//         （ blockSize ≥ 图尺寸时完全退化为全局，Otsu 的老毛病回归 ）
-Mat adapt11 = new Mat(), adapt101 = new Mat();
-Cv2.AdaptiveThreshold(uneven, adapt11, 255, AdaptiveThresholdTypes.MeanC,
-                      ThresholdTypes.Binary, 11, CC);
-Cv2.AdaptiveThreshold(uneven, adapt101, 255, AdaptiveThresholdTypes.MeanC,
-                      ThresholdTypes.Binary, 101, CC);
-// C 的直觉：C 越大 → 判决越严（要"比当地平均亮更多"才算目标）→ 白区精瘦
-//          C 太小 → 判决贴着当地平均 → 缓变区域自己跟自己比 → 大片误白
-Console.WriteLine("\n参数实验: 窗口4(51) vs 窗口6(11,碎) vs 窗口7(101,钝)");
+// 可视化 + 计数（GetArray 整块读 32S 标签，循环里纯内存）
+if (!markers.GetArray(out int[] labels))
+{
+    Console.WriteLine("GetArray 失败: markers 不是 32SC1");
+    return;
+}
+Scalar[] palette =                                  // 每个编号配一个颜色（BGR）
+{
+    new Scalar(80, 80, 80), new Scalar(0, 200, 255), new Scalar(0, 255, 0),
+    new Scalar(255, 200, 0), new Scalar(255, 0, 200), new Scalar(200, 0, 255),
+};
+Mat result = new Mat(h, w, MatType.CV_8UC3, new Scalar(0, 0, 0));
+HashSet<int> objects = new HashSet<int>();
+for (int y = 0; y < h; y++)
+{
+    for (int x = 0; x < w; x++)
+    {
+        int lab = labels[y * w + x];
+        if (lab == -1)                    // 分水岭划出的边界线
+            Cv2.Circle(result, new Point(x, y), 1, new Scalar(255, 255, 255), -1);
+        else if (lab >= 2)                // 物体区域: 按编号上色并记账
+        {
+            objects.Add(lab);
+            Cv2.Circle(result, new Point(x, y), 1, palette[(lab - 2) % palette.Length], -1);
+        }
+        else if (lab == 1)                // 背景
+            Cv2.Circle(result, new Point(x, y), 1, new Scalar(40, 40, 40), -1);
+    }
+}
+Console.WriteLine($"\n分水岭结果: {objects.Count} 个物体（老流水线数 1，真值 2）✓");
+Console.WriteLine("白色细线 = 两股水相遇的鞍部 = 自动切开的粘连颈");
 
-// ---------- 7. 路线二：平场校正（估计光照 → 除掉 → 再 Otsu） ----------
-// 物理模型: 拍到的图 = 物体反射率 × 光照强度
-//   物体是小形状（高频），光照是缓渐变（低频）
-//   大核高斯模糊 → 小物体被抹掉 → 剩下的就是光照场的估计
-//   原图 ÷ 光照 → 还原"反射率图"（等效把光照拉均匀）→ 全局 Otsu 复活
-Mat lightEst = new Mat();
-Cv2.GaussianBlur(uneven, lightEst, new Size(101, 101), 0);
-Mat f32 = new Mat(), light32 = new Mat(), ratio = new Mat();
-uneven.ConvertTo(f32, MatType.CV_32F);
-lightEst.ConvertTo(light32, MatType.CV_32F);
-light32 = light32 + new Scalar(1);       // 防零：光照估计为 0 的暗区除法会爆
-Cv2.Divide(f32, light32, ratio, 255.0);  // scale=255: 商×255 映回 0~255 量程
-Mat corrected = new Mat();
-Cv2.ConvertScaleAbs(ratio, corrected);   // 32F → 8U（宽算窄显，老规矩）
-Mat flatOtsu = new Mat();
-double flatTh = Cv2.Threshold(corrected, flatOtsu, 0, 255,
-                              ThresholdTypes.Binary | ThresholdTypes.Otsu);
-Console.WriteLine($"\n平场校正后 Otsu 阈值 = {flatTh:F0}（光照已除掉，一刀又能切好了）");
-// 适用边界：物体必须明显小于模糊核（101）—— 物体若比核还大，
-// 模糊抹不掉它 → 光照估计被物体污染 → 校正失败（和第九课分水岭的"分不开就上大杀器"同款预警）
+// ---------- 7. 参数实验：种子阈值 0.3 vs 0.5 vs 0.7 ----------
+// 阈值低(0.3): 种子大 → 两颗种子可能通过粘连颈连成一颗 → 又数成 1
+// 阈值高(0.7): 种子小 → 瘦物体的峰不够高 → 整个物体没有种子 → 漏数
+// 0.5 居中: 种子分离且每个物体都有一颗 —— 这个实验揭示分水岭的命门:
+//   种子选不对，分水岭也无能为力（垃圾进垃圾出）
+RunWatershed(mask, 0.3, "A-种子阈值0.3(种子过大,粘连)");
+RunWatershed(mask, 0.7, "B-种子阈值0.7(种子过小)");
 
 // ---------- 8. 展示 ----------
-Cv2.ImShow("1-光照不均图(左亮右暗)", uneven);
-Cv2.ImShow("2-全局Otsu-失败现场", otsuFail);
-Cv2.ImShow("3-手写自适应(积分图)", adaptManual);
-Cv2.ImShow($"4-API MeanC 窗口{BlockSize}", adaptMean);
-Cv2.ImShow($"5-API GaussianC 窗口{BlockSize}", adaptGauss);
-Cv2.ImShow("6-blockSize=11(碎)", adapt11);
-Cv2.ImShow("7-blockSize=101(钝,趋全局)", adapt101);
-Cv2.ImShow("8-平场校正-反射率图", corrected);
-Cv2.ImShow("9-平场+Otsu", flatOtsu);
+Cv2.ImShow("1-粘连二值图(真值2个)", mask);
+Cv2.ImShow("2-腐蚀5次(仍连着)", eroded5);
+Cv2.ImShow("3-距离图(亮=离边远=中心)", dist8u);
+Cv2.ImShow("4-种子(距离高地)", seeds);
+Cv2.ImShow($"5-分水岭: {objects.Count} 个物体", result);
 Cv2.WaitKey(0);
 Cv2.DestroyAllWindows();
 
 // ============================================================
 // 本课小结：
-// 1. 光照不均打破全局阈值的"全图一个标准"假设 → 一刀切两端各错一次
-// 2. 自适应阈值: 每像素阈值 = 邻域均值 − C，标准跟着当地亮度走
-// 3. 积分图: 一遍线性构建，任意矩形和 4 角加减 O(1) 查询 —— 性能大杀器
-// 4. blockSize 控制跟多"局部": 太小贴噪声, 太大退化为全局; C 是判决余量
-// 5. 平场校正: 大核模糊估光照 → 相除还原反射率 → Otsu 复活（物体须小于核）
-// 6. GetArray/SetArray 整块搬运像素，绕开逐次 At 的 P/Invoke 开销
-// 练习建议: 把第 2 节渐变改成上下方向、或系数 0.65 改 0.9，观察各法鲁棒性
+// 1. 距离变换: 白点到最近黑边的距离 → 每个物体一座山，山顶=最胖处
+// 2. 粘连物体 = 双峰山，鞍部在粘连颈 → 腐蚀吃不断(第四课伏笔验证)
+// 3. 分水岭: 从种子(山顶)漫水，相遇处划界 → 粘连颈被自动切开
+// 4. markers 协议: 0=未知, 1=背景, ≥2=物体种子; 输出边界=-1
+// 5. 种子质量决定成败: 阈值低种子粘连、阈值高瘦物体漏种 —— 垃圾进垃圾出
+// 6. 距离图峰值思想和 TopHat"相减留差"同构: 都是"和周围比出特征"
+// 练习建议: 把两圆圆心距改成 60/140, 观察种子阈值窗口何时失效
 // ============================================================
 
 // ---------- 工具函数 ----------
-// 手写自适应阈值（MeanC 语义）：阈值 = 邻域均值 − C，gray > 阈值 → 白
-// 边界处理：窗口越界只统计界内像素（与 OpenCV 的复制边缘补窗略不同，见第 5 节）
-static Mat AdaptiveMeanManual(Mat img, int blockSize, double C)
+// 用指定种子阈值跑一遍完整分水岭（第 7 节参数实验用，流程同第 5~6 节）
+static void RunWatershed(Mat mask, double ratio, string winName)
 {
-    int hh = img.Height, ww = img.Width;
-    if (!img.GetArray(out byte[] p))
-        throw new ArgumentException("AdaptiveMeanManual: img 必须是 8UC1");
+    int hh = mask.Height, ww = mask.Width;
+    Mat d = new Mat();
+    Cv2.DistanceTransform(mask, d, DistanceTypes.L2, DistanceTransformMasks.Mask3);
+    Cv2.MinMaxIdx(d, out _, out double maxD);
+    Mat sF = new Mat();
+    Cv2.Threshold(d, sF, maxD * ratio, 255, ThresholdTypes.Binary);
+    Mat s = new Mat();
+    sF.ConvertTo(s, MatType.CV_8UC1);
+    Point[][] sc = Cv2.FindContoursAsArray(s, RetrievalModes.External,
+                                           ContourApproximationModes.ApproxSimple);
+    Mat mk = new Mat(hh, ww, MatType.CV_32SC1, new Scalar(0));
+    Cv2.Rectangle(mk, new Rect(0, 0, ww, hh), new Scalar(1), 3);
+    for (int i = 0; i < sc.Length; i++)
+        Cv2.DrawContours(mk, sc, i, new Scalar(i + 2), -1);
 
-    // 积分图: (hh+1)×(ww+1)，第 0 行/列全 0 —— 多垫一圈零，查询时免边界 if
-    long[] s = new long[(hh + 1) * (ww + 1)];
+    Mat bgr = new Mat();
+    Cv2.CvtColor(mask, bgr, ColorConversionCodes.GRAY2BGR);
+    Cv2.Watershed(bgr, mk);
+
+    // 可视化: 种子数量即计数结果
+    if (!mk.GetArray(out int[] lab))
+        return;
+    Mat vis = new Mat(hh, ww, MatType.CV_8UC3, new Scalar(0, 0, 0));
+    HashSet<int> objs = new HashSet<int>();
     for (int y = 0; y < hh; y++)
-    {
-        long rowSum = 0;
-        int rowIdx = (y + 1) * (ww + 1), prevIdx = y * (ww + 1);
         for (int x = 0; x < ww; x++)
         {
-            rowSum += p[y * ww + x];                          // 当行累积
-            s[rowIdx + x + 1] = s[prevIdx + x + 1] + rowSum;  // 上方累积 + 当行
+            int v = lab[y * ww + x];
+            if (v == -1)
+                vis.Set(y, x, new Vec3b(255, 255, 255));
+            else if (v >= 2)
+            {
+                objs.Add(v);
+                vis.Set(y, x, new Vec3b(0, 200, 255));
+            }
+            else
+                vis.Set(y, x, new Vec3b(40, 40, 40));
         }
-    }
-
-    int r = blockSize / 2;
-    byte[] outPx = new byte[p.Length];
-    for (int y = 0; y < hh; y++)
-    {
-        int y1 = Math.Max(0, y - r), y2 = Math.Min(hh - 1, y + r);
-        for (int x = 0; x < ww; x++)
-        {
-            int x1 = Math.Max(0, x - r), x2 = Math.Min(ww - 1, x + r);
-            int cnt = (y2 - y1 + 1) * (x2 - x1 + 1);   // 界内实际像素数
-            // 4 角加减取窗口和（分母用界内像素数 → 边界是"缩小窗口"语义）
-            long rectSum = s[(y2 + 1) * (ww + 1) + x2 + 1]
-                         - s[y1 * (ww + 1) + x2 + 1]
-                         - s[(y2 + 1) * (ww + 1) + x1]
-                         + s[y1 * (ww + 1) + x1];
-            // 对齐 OpenCV：其内部 boxFilter 输出 8U，均值先舍入成整数再判
-            int meanI = (int)Math.Round((double)rectSum / cnt, MidpointRounding.AwayFromZero);
-            if (p[y * ww + x] > meanI - C) outPx[y * ww + x] = 255;
-        }
-    }
-    Mat dst = new Mat(hh, ww, MatType.CV_8UC1, new Scalar(0));
-    dst.SetArray(outPx);
-    return dst;
+    Cv2.PutText(vis, $"seeds={sc.Length} objects={objs.Count}", new Point(15, 30),
+                HersheyFonts.HersheySimplex, 0.7, new Scalar(0, 255, 0), 2);
+    Cv2.ImShow(winName, vis);
 }
