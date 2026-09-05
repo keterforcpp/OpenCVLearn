@@ -1,247 +1,180 @@
 using OpenCvSharp;
 
 // ============================================================
-// 第九课：距离变换与分水岭 —— 粘连目标的分割与计数
+// 第十课：几何变换 —— 移动、旋转、缩放像素的"坐标搬运术"
 // ============================================================
-// 第五课实战问题二：物体粘连 → FindContours 把两个数成一个
-// 第四课伏笔回收："腐蚀分不开的粘连，上分水岭"
+// 核心反转：几何变换不是"搬像素"，而是"对新图每个位置问：
+//   我该去原图哪个坐标取色？" —— 反向映射（backward mapping）
 //
-// 核心思想（地质比喻）：
-//   距离变换: 二值图上每个白点到最近黑边的距离
-//     → 物体中心离边界最远 → 距离图上每个物体一座"山丘"
-//     → 两个粘连物体 = 两座山共用一条坡（粘连颈是山脊上的鞍部）
-//   分水岭: 从每个山丘顶部(种子)向外"漫水"
-//     → 两边的水在鞍部相遇 → 相遇线就是切割线
-//   一句话: 独立物体各有"最胖处"，从最胖处向外认领地盘，
-//           接壤处自然就是分界 —— 这正是人眼分辨粘连物体的方式
+//   为什么反向？正向（旧像素→新位置）会留下"洞"：
+//     旋转后两个旧像素可能落到同一格（重叠），某些新格没人落（洞）
+//   反向保证：新图每格都有且仅有一次取值机会 → 无洞、无重叠
+//
+// 三种变换由一个矩阵统一（仿射矩阵 2x3）：
+//   平移: [1 0 tx]   缩放: [sx 0 0 ]   旋转: [cosθ -sinθ 0]
+//         [0 1 ty]         [0  sy 0]         [sinθ  cosθ 0]
+//   WarpAffine 一个函数全包 —— 换矩阵 = 换变换
+//
+// 插值：坐标搬运后落在"格子之间"（如 (3.7, 5.2)），取色要插值
+//   最近邻: 抄最近的格 → 快但锯齿      （教学：手写感受它）
+//   双线性: 四邻域加权 → 慢一点但平滑  （工程默认）
+//   INTER_NEAREST 放大二值图/标签图必用（插值会造出新灰度值）
 // ============================================================
 
-// ---------- 0. 数字实例：距离变换就是"量到边有多远" ----------
-// 一行二值图（0=黑边, 1=物体）:  0 0 1 1 1 1 1 0 0
-// 每个白点到最近黑边的距离:     0 0 1 2 3 2 1 0 0
-//                                     ↑
-//                          离两边一样远的位置 = 物体"中线"
-// 单个物体 → 一座单峰山；两个粘连物体 → 双峰，鞍部在粘连颈
-Console.WriteLine("距离变换: 每个白点标上'到最近黑边的距离'");
-Console.WriteLine("例: [0 0 1 1 1 1 1 0 0] → [0 0 1 2 3 2 1 0 0]（峰在中线）\n");
+// ---------- 0. 数字实例：反向映射怎么算 ----------
+// 旋转 90° 时新图 (x', y') 该去原图哪取？
+//   反算公式 x = y', y = w'-1-x'（旋转的逆）
+// 例：新图 (0,0) ← 原图 (0, 2)（3 宽小图）
+// 更一般地，仿射用矩阵逆：原图坐标 = M⁻¹ × 新图坐标
+// WarpAffine 内部就是"对每个新像素，套逆矩阵，去原图取色"
+Console.WriteLine("反向映射: 新图每格反问'我来自原图哪里' → 无洞无重叠");
+Console.WriteLine("插值: 反算出的坐标是(3.7,5.2)这种小数 → 用周围格子估算\n");
 
-// ---------- 1. 合成粘连图：两个重叠的圆 ----------
-// 用合成图而非照片：粘连程度可控，保证演示效果稳定
-// 两圆 r=70、圆心距 100 < 140 → 重叠粘连，FindContours 只见 1 个轮廓
-Mat mask = new Mat(400, 500, MatType.CV_8UC1, new Scalar(0));
-Cv2.Circle(mask, new Point(200, 200), 70, new Scalar(255), -1);
-Cv2.Circle(mask, new Point(300, 200), 70, new Scalar(255), -1);
-int h = mask.Height, w = mask.Width;
-Console.WriteLine($"合成粘连图: 两圆 r=70, 圆心距 100（重叠 40 像素）");
+// ---------- 1. 读取 ----------
+Mat src = Cv2.ImRead(@"3.jpg", ImreadModes.Color);
+if (src.Empty())
+{
+    Console.WriteLine("读取失败：请确认 3.jpg 在项目输出目录（bin/Debug/net8.0）中");
+    return;
+}
+int h = src.Height, w = src.Width;
+Console.WriteLine($"原图 {w}x{h}");
 
-// ---------- 2. 病理展示：老流水线计数 = 1 ----------
-Point[][] contours = Cv2.FindContoursAsArray(mask, RetrievalModes.External,
-                                             ContourApproximationModes.ApproxSimple);
-Console.WriteLine($"\n老流水线(FindContours): 数出 {contours.Length} 个物体（真值 2）← 病");
+// ---------- 2. 缩放 Resize + 插值方法对比 ----------
+// 缩到 1/4 再放回原尺寸 —— 模拟"低分辨率损失"
+// 近期邻(左): 像素块感、锯齿 —— 每格抄一个邻居，无新颜色产生
+// 双线性(右): 平滑 —— 四邻域按距离加权，会"造出"原图没有的中间色
+Mat smallN = new Mat(), smallB = new Mat();
+Cv2.Resize(src, smallN, new Size(w / 4, h / 4), 0, 0, InterpolationFlags.Nearest);
+Cv2.Resize(src, smallB, new Size(w / 4, h / 4), 0, 0, InterpolationFlags.Linear);
+Mat backN = new Mat(), backB = new Mat();
+Cv2.Resize(smallN, backN, new Size(w, h), 0, 0, InterpolationFlags.Nearest);
+Cv2.Resize(smallB, backB, new Size(w, h), 0, 0, InterpolationFlags.Linear);
+Console.WriteLine("缩小再放大: 左=最近邻(块状锯齿) vs 右=双线性(平滑发糊)");
 
-// 腐蚀能救吗？（第四课的老工具）
-// 粘连颈宽约 98 像素，腐蚀每次只把边界往里吃 ~2 像素
-//   → 吃到颈断开需要 ~25 次，但那时圆(r=70)也被吃得只剩壳
-//   → "腐蚀分不开，分开时物体也没了" —— 第四课埋的伏笔，本课验证
-Mat eroded5 = new Mat();
-Mat kernel5 = Cv2.GetStructuringElement(MorphShapes.Ellipse, new Size(5, 5));
-Cv2.Erode(mask, eroded5, kernel5, null, 5);   // 迭代 5 次
-Point[][] c5 = Cv2.FindContoursAsArray(eroded5, RetrievalModes.External,
-                                       ContourApproximationModes.ApproxSimple);
-Console.WriteLine($"腐蚀 5 次后: 仍 {c5.Length} 个（颈太肥，吃不动）");
-Console.WriteLine("结论: 粘连靠腐蚀无解 → 需要分水岭");
-
-// ---------- 3. 手写距离变换（小图暴力版）vs API 对照 ----------
-// 原理暴力版: 每个白点，扫描全图找最近的黑点，算欧氏距离
-//   O(N²) 只在演示小图上可行 —— 大图必须用 OpenCV 的两遍扫描法
-// 小图 14x6，两个粘连的矩形块
-Mat small = new Mat(6, 14, MatType.CV_8UC1, new Scalar(0));
-Cv2.Rectangle(small, new Rect(2, 1, 4, 4), new Scalar(255), -1);
-Cv2.Rectangle(small, new Rect(8, 1, 4, 4), new Scalar(255), -1);
-// 注意: 两块横向间隔 2 像素、不粘连 → 距离图应是两座独立小山
-if (!small.GetArray(out byte[] sp))
+// ---------- 3. 手写最近邻缩放（3x 放大） ----------
+// 亲手实现"反向映射 + 最近邻"：对放大图每格，反算原图坐标，抄最近格
+// 缩放的反向映射是除法: 原图坐标 = 新图坐标 / 放大倍数
+// 例: 放大3倍后新图 x=7 → 原图 7/3=2.33 → 最近邻取 2
+int scale = 3;
+int hw = w * scale, hh = h * scale;
+Mat bigManual = new Mat(hh, hw, MatType.CV_8UC3, new Scalar(0, 0, 0));
+if (!src.GetArray(out Vec3b[] srcPx))
 {
     Console.WriteLine("GetArray 失败");
     return;
 }
-int sh = small.Height, sw = small.Width;
-float[,] manual = new float[sh, sw];
-for (int y = 0; y < sh; y++)
+for (int y = 0; y < hh; y++)
 {
-    for (int x = 0; x < sw; x++)
+    int sy = Math.Min(h - 1, (int)Math.Round(y / (double)scale, MidpointRounding.AwayFromZero));
+    for (int x = 0; x < hw; x++)
     {
-        if (sp[y * sw + x] == 0) { manual[y, x] = 0; continue; }
-        float best = float.MaxValue;
-        for (int yy = 0; yy < sh; yy++)          // 暴力: 扫全图找最近黑点
-            for (int xx = 0; xx < sw; xx++)
-            {
-                if (sp[yy * sw + xx] != 0) continue;
-                float d = MathF.Sqrt((yy - y) * (yy - y) + (xx - x) * (xx - x));
-                if (d < best) best = d;
-            }
-        manual[y, x] = best;
+        int sx = Math.Min(w - 1, (int)Math.Round(x / (double)scale, MidpointRounding.AwayFromZero));
+        // 最近邻 = 抄 (sy,sx) 一个格子（无插值、无新颜色）
+        bigManual.Set(y, x, srcPx[sy * w + sx]);
     }
 }
-Mat distSmall = new Mat();
-Cv2.DistanceTransform(small, distSmall, DistanceTypes.L2, DistanceTransformMasks.Mask3);
-float maxErr = 0;
-for (int y = 0; y < sh; y++)
-    for (int x = 0; x < sw; x++)
-    {
-        float err = MathF.Abs(manual[y, x] - distSmall.At<float>(y, x));
-        if (err > maxErr) maxErr = err;
-    }
-Console.WriteLine($"\n手写暴力距离变换 vs Cv2.DistanceTransform 最大差 = {maxErr:F3}（应≈0）");
-Console.WriteLine("距离图(手写, 每行14列):");
-for (int y = 0; y < sh; y++)
+Mat bigApi = new Mat();
+Cv2.Resize(src, bigApi, new Size(hw, hh), 0, 0, InterpolationFlags.Nearest);
+Mat diffMat = new Mat();
+Cv2.Absdiff(bigManual, bigApi, diffMat);
+Cv2.MinMaxIdx(diffMat, out _, out double maxDiff);
+Console.WriteLine($"\n手写最近邻放大 vs Resize(Nearest) 最大像素差 = {maxDiff}（应为 0）");
+
+// ---------- 4. 平移：最简单的仿射 ----------
+// 仿射矩阵 2x3: [1 0 tx; 0 1 ty] —— 不旋转不缩放，只挪 (tx,ty)
+// WarpAffine(src, dst, M, 输出尺寸): M 的 C# 形态是 2x3 Mat（CV_64F）
+Mat tMat = Mat.FromArray<double>(1, 0, 100, 0, 1, 50);   // 右移100 下移50
+Mat shifted = new Mat();
+Cv2.WarpAffine(src, shifted, tMat, src.Size());
+Console.WriteLine("\n平移: 右移100下移50 —— 挪出去的部分丢失，留进来的部分是黑");
+Console.WriteLine("（黑 = new Mat 打底色，反向映射取不到原图的地方填 Scalar 默认值）");
+
+// ---------- 5. 旋转：GetRotationMatrix2D 生成矩阵 ----------
+// 参数: (旋转中心, 角度(度,正=逆时针), 缩放系数)
+// 生成的矩阵 = 平移到中心 → 旋转 → 平移回去 的复合（绕指定点转，不是绕原点）
+// 中心取图像中心 → 旋转后内容大致还在画面里
+double angle = 30;
+Mat rotMat = Cv2.GetRotationMatrix2D(new Point2f(w / 2f, h / 2f), angle, 1.0);
+Mat rotated = new Mat();
+Cv2.WarpAffine(src, rotated, rotMat, src.Size());
+Console.WriteLine($"\n旋转 {angle}°: 四角出现黑边（原图是矩形，转完矩形超出画面）");
+
+// ---------- 6. 旋转矫正：算"转正后不裁边"的新画布 ----------
+// 绕中心旋转仍用原尺寸画布 → 四角被裁（窗口5的黑角）
+// 工程做法：按旋转后的外接矩形尺寸，把中心平移到新画布中心
+// 新宽 = |w·cosθ| + |h·sinθ|，新高 = |w·sinθ| + |h·cosθ|
+//   —— 原图四个角旋转后的横坐标极值差 = 新宽（包围盒思想）
+double rad = angle * Math.PI / 180.0;
+double cos = Math.Abs(Math.Cos(rad)), sin = Math.Abs(Math.Sin(rad));
+int nw = (int)Math.Round(w * cos + h * sin);
+int nh = (int)Math.Round(w * sin + h * cos);
+// 在旋转矩阵上追加平移: 把旋转中心从旧图中心挪到新图中心
+rotMat.At<double>(0, 2) += (nw - w) / 2.0;
+rotMat.At<double>(1, 2) += (nh - h) / 2.0;
+Mat rotatedFit = new Mat();
+Cv2.WarpAffine(src, rotatedFit, rotMat, new Size(nw, nh));
+Console.WriteLine($"旋转+扩画布: 新尺寸 {nw}x{nh}（外接矩形，四角不裁）");
+
+// ---------- 7. 参数实验：插值方法对旋转的影响 ----------
+// 旋转(非90°倍数)后反算坐标全是小数 → 插值方法直接影响画质
+// Nearest: 边缘锯齿台阶   Linear: 边缘平滑（多1次运算×4邻域）
+Mat rotNear = new Mat();
+Mat rotMat2 = Cv2.GetRotationMatrix2D(new Point2f(w / 2f, h / 2f), angle, 1.0);
+Cv2.WarpAffine(src, rotNear, rotMat2, src.Size(), InterpolationFlags.Nearest);
+Console.WriteLine("\n参数实验: 窗口5(双线性) vs 窗口8(最近邻) —— 盯边缘看锯齿差异");
+
+// ---------- 8. 二值图/标签图的坑：必须 Nearest ----------
+// 用双线性缩放二值图 = 造出 0~255 之间的新灰度 → 二值图变"灰值图"
+// 例: 原图 0 和 255 相邻, 双线性插出 128 —— mask 被污染
+Mat bin = new Mat();
+Cv2.CvtColor(src, bin, ColorConversionCodes.BGR2GRAY);
+Cv2.Threshold(bin, bin, 0, 255, ThresholdTypes.Binary | ThresholdTypes.Otsu);
+Mat binLinear = new Mat(), binNear = new Mat();
+Cv2.Resize(bin, binLinear, new Size(w / 3, h / 3), 0, 0, InterpolationFlags.Linear);
+Cv2.Resize(bin, binNear, new Size(w / 3, h / 3), 0, 0, InterpolationFlags.Nearest);
+int grayCount = 0;
+if (binLinear.GetArray(out byte[] bp))
 {
-    Console.Write("  ");
-    for (int x = 0; x < sw; x++) Console.Write($"{manual[y, x],4:F0}");
-    Console.WriteLine();
+    for (int i = 0; i < bp.Length; i++)
+        if (bp[i] != 0 && bp[i] != 255) grayCount++;   // 数"中间灰度"像素
 }
-Console.WriteLine("→ 两座小山各一个峰 = 两个独立物体（若粘连则鞍部相连）\n");
+Console.WriteLine($"\n二值图用双线性缩小: {grayCount} 个像素被插成中间灰度（mask 已污染）");
+Console.WriteLine("结论: mask/标签图缩放永远用 Nearest（第九课 markers 同理）");
 
-// ---------- 4. 大图距离变换 ----------
-// 输入 8UC1 二值图, 输出 32FC1 距离图（At<float> 读！）
-// DistL2 = 欧氏距离（还有 DistL1 曼哈顿/ DistC 棋盘等近似，L2 最准）
-Mat dist = new Mat();
-Cv2.DistanceTransform(mask, dist, DistanceTypes.L2, DistanceTransformMasks.Mask3);
-Cv2.MinMaxIdx(dist, out _, out double maxDist);
-Console.WriteLine($"大图距离变换: 最大距离 = {maxDist:F1}（≈圆半径，山最高的地方）");
-// 显示: 32F 距离图归一化到 0~255 才能看（越亮=离边越远=越靠物体中心）
-Mat distShow = new Mat();
-Cv2.Normalize(dist, distShow, 0, 255, NormTypes.MinMax);
-Mat dist8u = new Mat();
-Cv2.ConvertScaleAbs(distShow, dist8u);
-
-// ---------- 5. 构造种子和 markers（分水岭的"发令枪"） ----------
-// 种子 = 距离图的高地（> maxDist×0.5）→ 每个物体"最胖处"的一小块
-// 相对阈值（第五课老规矩）: 门槛跟最大距离走，不用手调绝对值
-Mat seedsF = new Mat();
-Cv2.Threshold(dist, seedsF, maxDist * 0.5, 255, ThresholdTypes.Binary);
-Mat seeds = new Mat();
-seedsF.ConvertTo(seeds, MatType.CV_8UC1);
-Point[][] seedContours = Cv2.FindContoursAsArray(seeds, RetrievalModes.External,
-                                                 ContourApproximationModes.ApproxSimple);
-Console.WriteLine($"\n种子提取: 距离 > {maxDist * 0.5:F0} 的高地 → {seedContours.Length} 颗种子（每物体一颗）");
-
-// markers: 32SC1 整数标签图（分水岭的输入输出）
-//   0     = 未知区域（水还没漫到，交给算法判决）
-//   1     = 背景（图像边框一圈 —— 背景也需要种子，否则会被物体吞并）
-//   2,3.. = 各物体的种子（DrawContours 填充写编号）
-Mat markers = new Mat(h, w, MatType.CV_32SC1, new Scalar(0));   // 不清零老坑: 显式给 0
-Cv2.Rectangle(markers, new Rect(0, 0, w, h), new Scalar(1), 3); // 边框线标背景=1
-for (int i = 0; i < seedContours.Length; i++)
-    Cv2.DrawContours(markers, seedContours, i, new Scalar(i + 2), -1);  // 种子区标 2,3..
-
-// ---------- 6. 分水岭：漫水、相遇、划界 ----------
-Mat maskBgr = new Mat();
-Cv2.CvtColor(mask, maskBgr, ColorConversionCodes.GRAY2BGR);   // Watershed 要 8UC3 输入
-Cv2.Watershed(maskBgr, markers);   // markers 原地改写: 每像素=归属编号, 边界=-1
-
-// 可视化 + 计数（GetArray 整块读 32S 标签，循环里纯内存）
-if (!markers.GetArray(out int[] labels))
-{
-    Console.WriteLine("GetArray 失败: markers 不是 32SC1");
-    return;
-}
-Scalar[] palette =                                  // 每个编号配一个颜色（BGR）
-{
-    new Scalar(80, 80, 80), new Scalar(0, 200, 255), new Scalar(0, 255, 0),
-    new Scalar(255, 200, 0), new Scalar(255, 0, 200), new Scalar(200, 0, 255),
-};
-Mat result = new Mat(h, w, MatType.CV_8UC3, new Scalar(0, 0, 0));
-HashSet<int> objects = new HashSet<int>();
-for (int y = 0; y < h; y++)
-{
-    for (int x = 0; x < w; x++)
-    {
-        int lab = labels[y * w + x];
-        if (lab == -1)                    // 分水岭划出的边界线
-            Cv2.Circle(result, new Point(x, y), 1, new Scalar(255, 255, 255), -1);
-        else if (lab >= 2)                // 物体区域: 按编号上色并记账
-        {
-            objects.Add(lab);
-            Cv2.Circle(result, new Point(x, y), 1, palette[(lab - 2) % palette.Length], -1);
-        }
-        else if (lab == 1)                // 背景
-            Cv2.Circle(result, new Point(x, y), 1, new Scalar(40, 40, 40), -1);
-    }
-}
-Console.WriteLine($"\n分水岭结果: {objects.Count} 个物体（老流水线数 1，真值 2）✓");
-Console.WriteLine("白色细线 = 两股水相遇的鞍部 = 自动切开的粘连颈");
-
-// ---------- 7. 参数实验：种子阈值 0.3 vs 0.5 vs 0.7 ----------
-// 阈值低(0.3): 种子大 → 两颗种子可能通过粘连颈连成一颗 → 又数成 1
-// 阈值高(0.7): 种子小 → 瘦物体的峰不够高 → 整个物体没有种子 → 漏数
-// 0.5 居中: 种子分离且每个物体都有一颗 —— 这个实验揭示分水岭的命门:
-//   种子选不对，分水岭也无能为力（垃圾进垃圾出）
-RunWatershed(mask, 0.3, "A-种子阈值0.3(种子过大,粘连)");
-RunWatershed(mask, 0.7, "B-种子阈值0.7(种子过小)");
-
-// ---------- 8. 展示 ----------
-Cv2.ImShow("1-粘连二值图(真值2个)", mask);
-Cv2.ImShow("2-腐蚀5次(仍连着)", eroded5);
-Cv2.ImShow("3-距离图(亮=离边远=中心)", dist8u);
-Cv2.ImShow("4-种子(距离高地)", seeds);
-Cv2.ImShow($"5-分水岭: {objects.Count} 个物体", result);
+// ---------- 9. 展示 ----------
+Cv2.ImShow("1-原图", src);
+Cv2.ImShow("2-缩放对比-最近邻(块状)", backN);
+Cv2.ImShow("3-缩放对比-双线性(平滑)", backB);
+Cv2.ImShow("4-手写最近邻放大3x", bigManual);
+Cv2.ImShow("5-平移(100,50)", shifted);
+Cv2.ImShow($"6-旋转{angle}°-原画布(裁角)", rotated);
+Cv2.ImShow($"7-旋转{angle}°-扩画布{nw}x{nh}", rotatedFit);
+Cv2.ImShow("8-旋转-最近邻(锯齿)", rotNear);
+Cv2.ImShow("9-二值缩放-左Linear右Nearest拼图", HConcat(binLinear, binNear));
 Cv2.WaitKey(0);
 Cv2.DestroyAllWindows();
 
 // ============================================================
 // 本课小结：
-// 1. 距离变换: 白点到最近黑边的距离 → 每个物体一座山，山顶=最胖处
-// 2. 粘连物体 = 双峰山，鞍部在粘连颈 → 腐蚀吃不断(第四课伏笔验证)
-// 3. 分水岭: 从种子(山顶)漫水，相遇处划界 → 粘连颈被自动切开
-// 4. markers 协议: 0=未知, 1=背景, ≥2=物体种子; 输出边界=-1
-// 5. 种子质量决定成败: 阈值低种子粘连、阈值高瘦物体漏种 —— 垃圾进垃圾出
-// 6. 距离图峰值思想和 TopHat"相减留差"同构: 都是"和周围比出特征"
-// 练习建议: 把两圆圆心距改成 60/140, 观察种子阈值窗口何时失效
+// 1. 几何变换 = 反向映射: 新图每格反问"去原图哪取色" → 无洞无重叠
+// 2. 仿射矩阵 2x3 统一平移/缩放/旋转; WarpAffine 换矩阵即换变换
+// 3. 坐标落格间 → 插值: 最近邻(快/锯齿) vs 双线性(慢/平滑)
+// 4. 旋转不裁边: 新画布 = 旋转外接矩形 + 中心平移修正
+// 5. 二值/标签图缩放必须 Nearest —— Linear 会插出中间灰度污染 mask
+// 6. 平移丢失的部分补黑 = 反向映射取不到原图时的默认填充
+// 练习建议: 把角度改成 90/45/-30, 观察外接矩形尺寸与黑角的变化
 // ============================================================
 
 // ---------- 工具函数 ----------
-// 用指定种子阈值跑一遍完整分水岭（第 7 节参数实验用，流程同第 5~6 节）
-static void RunWatershed(Mat mask, double ratio, string winName)
+// 水平拼接两张单通道图（拼图对比用；尺寸不同时以第一张为准裁剪）
+static Mat HConcat(Mat a, Mat b)
 {
-    int hh = mask.Height, ww = mask.Width;
-    Mat d = new Mat();
-    Cv2.DistanceTransform(mask, d, DistanceTypes.L2, DistanceTransformMasks.Mask3);
-    Cv2.MinMaxIdx(d, out _, out double maxD);
-    Mat sF = new Mat();
-    Cv2.Threshold(d, sF, maxD * ratio, 255, ThresholdTypes.Binary);
-    Mat s = new Mat();
-    sF.ConvertTo(s, MatType.CV_8UC1);
-    Point[][] sc = Cv2.FindContoursAsArray(s, RetrievalModes.External,
-                                           ContourApproximationModes.ApproxSimple);
-    Mat mk = new Mat(hh, ww, MatType.CV_32SC1, new Scalar(0));
-    Cv2.Rectangle(mk, new Rect(0, 0, ww, hh), new Scalar(1), 3);
-    for (int i = 0; i < sc.Length; i++)
-        Cv2.DrawContours(mk, sc, i, new Scalar(i + 2), -1);
-
-    Mat bgr = new Mat();
-    Cv2.CvtColor(mask, bgr, ColorConversionCodes.GRAY2BGR);
-    Cv2.Watershed(bgr, mk);
-
-    // 可视化: 种子数量即计数结果
-    if (!mk.GetArray(out int[] lab))
-        return;
-    Mat vis = new Mat(hh, ww, MatType.CV_8UC3, new Scalar(0, 0, 0));
-    HashSet<int> objs = new HashSet<int>();
-    for (int y = 0; y < hh; y++)
-        for (int x = 0; x < ww; x++)
-        {
-            int v = lab[y * ww + x];
-            if (v == -1)
-                vis.Set(y, x, new Vec3b(255, 255, 255));
-            else if (v >= 2)
-            {
-                objs.Add(v);
-                vis.Set(y, x, new Vec3b(0, 200, 255));
-            }
-            else
-                vis.Set(y, x, new Vec3b(40, 40, 40));
-        }
-    Cv2.PutText(vis, $"seeds={sc.Length} objects={objs.Count}", new Point(15, 30),
-                HersheyFonts.HersheySimplex, 0.7, new Scalar(0, 255, 0), 2);
-    Cv2.ImShow(winName, vis);
+    int hh = Math.Min(a.Height, b.Height);
+    int w1 = Math.Min(a.Width, b.Width);
+    Mat ra = a.SubMat(new Rect(0, 0, w1, hh));
+    Mat rb = b.SubMat(new Rect(0, 0, Math.Min(b.Width, w1), hh));
+    Mat outMat = new Mat();
+    Cv2.HConcat(ra, rb, outMat);
+    return outMat;
 }
