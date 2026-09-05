@@ -84,7 +84,10 @@ Console.WriteLine($"\n手写最近邻放大 vs Resize(Nearest) 最大像素差 =
 // ---------- 4. 平移：最简单的仿射 ----------
 // 仿射矩阵 2x3: [1 0 tx; 0 1 ty] —— 不旋转不缩放，只挪 (tx,ty)
 // WarpAffine(src, dst, M, 输出尺寸): M 的 C# 形态是 2x3 Mat（CV_64F）
-Mat tMat = Mat.FromArray<double>(1, 0, 100, 0, 1, 50);   // 右移100 下移50
+// 坑: Mat.FromArray(1,0,100,0,1,50) 传的是一维数组 → 造出 6x1 单列矩阵
+//     WarpAffine 断言 rows==2 && cols==3 直接抛异常
+//     必须传二维数组 double[2,3] 才是 2x3
+Mat tMat = Mat.FromArray<double>(new double[,] { { 1, 0, 100 }, { 0, 1, 50 } });   // 右移100 下移50
 Mat shifted = new Mat();
 Cv2.WarpAffine(src, shifted, tMat, src.Size());
 Console.WriteLine("\n平移: 右移100下移50 —— 挪出去的部分丢失，留进来的部分是黑");
