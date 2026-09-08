@@ -84,9 +84,10 @@ for (int y = 0; y <= sh - sth; y++)                // 滑窗: 模板左上角的
 // API 对照(缩小图上同尺度比较)
 Mat resultSmall = new Mat();
 Cv2.MatchTemplate(smallSrc, smallTpl, resultSmall, TemplateMatchModes.SqDiff);
-// 坑: MinMaxIdx 的 minIdx/maxIdx 不是 out 参数, 要传预分配数组进去填充
-int[] apiMinLoc = new int[2];
-Cv2.MinMaxIdx(resultSmall, out double apiMin, out _, apiMinLoc, null!);
+// 坑: MinMaxIdx 的 minIdx/maxIdx 不是 out 参数, 要传预分配数组进去填充;
+//      且两个数组都必须给(null 会被运行时拒绝), 不关心的也塞个占位数组
+int[] apiMinLoc = new int[2], apiMaxLoc = new int[2];
+Cv2.MinMaxIdx(resultSmall, out double apiMin, out _, apiMinLoc, apiMaxLoc);
 Console.WriteLine($"\n手写 SQDIFF: 最优 ({bestX},{bestY}) 得分 {bestScore}");
 Console.WriteLine($"API  SqDiff: 最优 ({apiMinLoc[0]},{apiMinLoc[1]}) 得分 {apiMin:F0}");
 Console.WriteLine($"位置一致: {bestX == apiMinLoc[0] && bestY == apiMinLoc[1]}（应为 True）");
@@ -130,8 +131,8 @@ Cv2.Normalize(resCc, showCc, 0, 255, NormTypes.MinMax);
 Mat showSq8 = new Mat(), showCc8 = new Mat();
 Cv2.ConvertScaleAbs(showSq, showSq8);
 Cv2.ConvertScaleAbs(showCc, showCc8);
-int[] sqMinLoc = new int[2];
-Cv2.MinMaxIdx(resSq, out _, out _, sqMinLoc, null!);   // SqDiff 反着: 最小才像
+int[] sqMinLoc = new int[2], sqMaxLoc = new int[2];
+Cv2.MinMaxIdx(resSq, out _, out _, sqMinLoc, sqMaxLoc);   // SqDiff 反着: 最小才像
 Cv2.Circle(showSq8, new Point(sqMinLoc[0], sqMinLoc[1]), 8, new Scalar(255), 2);
 Console.WriteLine("\n参数实验: 三族结果图对比(都归一化显示)");
 Console.WriteLine("  SqDiffNormed: 目标=最暗点(注意'最小'才是答案)");
