@@ -1,153 +1,166 @@
 using OpenCvSharp;
 
 // ============================================================
-// 第十一课：霍夫变换 —— 到"参数空间"去投票找直线和圆
+// 第十二课：模板匹配 —— 拿一小块图当"模板"去大图里找它
 // ============================================================
-// 核心思想（和第九课分水岭同族: 换个空间看问题）:
-//   在原图找直线很难（像素零散、有噪声、有断裂）
-//   但换个视角: "一条直线" 由参数(θ, ρ)唯一确定
-//     x·cosθ + y·sinθ = ρ     （原点到直线的垂线: 角θ、长度ρ）
-//   → 图上每个白色边缘点，都能列出"经过我的所有直线"的参数方程
-//     在(θ,ρ)参数空间里，这是一条曲线
-//   → 多个点共线 = 它们的曲线在参数空间交于一点
-//   → 投票: 每个边缘点给"所有可能经过自己的直线"各投一票
-//     得票高的格子 = 真实存在的直线 —— 共线点的共识
+// 核心思想（第二课卷积的近亲）:
+//   卷积: 小核在图上滑动，每位置算"加权求和"
+//   模板匹配: 模板在图上滑动，每位置算"这块和模板像不像"
+//   区别: 卷积核是几x几的小数字, 模板是一张真正的小图;
+//         卷积输出通道图, 匹配输出"相似度地图"(结果图)
 //
-// 一句话: 原图里"点共线"这个几何关系，翻译成参数空间里"曲线共点"
-//        找直线 = 找曲线的交点 = 找票数峰值（局部极大值）
+// 结果图的读法（本课最重要认知）:
+//   结果图比原图小(宽-w+1, 高-h+1), 每个格子 = "模板左上角放这时的得分"
+//   得分最高的格子位置 = 模板在大图中的位置
+//   → 模板定位 = 找结果图的峰值 = MinMaxLoc 一行搞定
 //
-// 两代实现:
-//   标准 HoughLines   : 返回无限长直线（数学直线），需自己延伸画线
-//   概率 HoughLinesP  : 只在边缘点的子集上投票(快) + 返回线段端点(实用)
-//   工程首选 P 版 —— 本课两者都演示，HoughCircles 找圆同理投票
+// 六种方法分三族:
+//   SQDIFF  差的平方和   越小越像(谷底找最小)
+//   CCORR   互相关       越大越像(但受亮度影响: 都很亮时即使不像分也高)
+//   CCOEFF  去均值相关   越大越像(先减各自均值再相关 → 抗整体亮暗)
+//   各带 _NORMED 后缀 = 归一化到 [-1,1] 或 [0,1] → 跨图可比, 工程标配
+// 工程默认: TM_CCOEFF_NORMED (1=完美, 0=无关, -1=负相关)
 // ============================================================
 
-// ---------- 0. 数字实例: 一个点对应参数空间一条曲线 ----------
-// 边缘点 (3, 4)，"经过我的直线"有无穷多条，每条一组(θ,ρ):
-//   θ=0°:   ρ = 3·1 + 4·0 = 3      （竖直线 x=3）
-//   θ=90°:  ρ = 3·0 + 4·1 = 4      （水平线 y=4）
-//   θ=45°:  ρ = 3·0.707 + 4·0.707 ≈ 4.95
-//   → 点(3,4)在(θ,ρ)空间里画出一条起伏的曲线（正弦形）
-// 两个点 (3,4) 和 (6,8) 共线（都在 y = 4x/3 上）:
-//   θ=53.13°(atan(4/3)) 时两点的 ρ 都是 0 —— 两条曲线在此相交!
-//   相交格子得 2 票; 加第三个共线点 → 3 票... 票数 = 共线点数
-Console.WriteLine("参数空间: 每个边缘点画出一条(θ,ρ)曲线");
-Console.WriteLine("曲线相交处 = 共线共识 = 得票峰值 = 检出直线\n");
+// ---------- 0. 数字实例: "像不像"怎么算成一个数 ----------
+// 模板 3 像素 [10, 20, 30], 图上两个窗口:
+//   窗口A [10, 20, 30]: 差的平方和 = 0+0+0 = 0      ← 一模一样
+//   窗口B [10, 20, 40]: 差的平方和 = 0+0+100 = 100  ← 差一点
+//   窗口C [50, 60, 70]: 差的平方和 = 1600+1600+1600 = 4800 ← 完全不像
+// → "像不像"被压成一个数, 数值可比较 → 扫全图取最优
+// CCOEFF 的改进: 模板均值20, 窗口B均值23.3, 先各自减均值再比
+//   → 整体偏亮/偏暗不影响判断(只比"形状"不比"亮度")
+Console.WriteLine("匹配 = 滑窗逐位置算'相似度', 相似度地图的峰值 = 目标位置\n");
 
-// ---------- 1. 读取 + Canny 边缘（第三课回收: 霍夫的输入是边缘图） ----------
+// ---------- 1. 读取 + 自动截模板 ----------
+// 教学技巧: 从原图中央裁一块当模板 → 任何图都能演示,
+// 且"模板一定在图中存在"(得分必然接近 1)
 Mat src = Cv2.ImRead(@"3.jpg", ImreadModes.Color);
 if (src.Empty())
 {
     Console.WriteLine("读取失败：请确认 3.jpg 在项目输出目录（bin/Debug/net8.0）中");
     return;
 }
-Mat gray = new Mat();
-Cv2.CvtColor(src, gray, ColorConversionCodes.BGR2GRAY);
-Mat edges = new Mat();
-Cv2.Canny(gray, edges, 50, 150);   // 1:3 双阈值比例（第三课规矩）
-Console.WriteLine($"Canny 边缘完成（霍夫的投票人 = 白色边缘点）");
+int h = src.Height, w = src.Width;
+int tw = w / 5, th = h / 5;                        // 模板 1/5 尺寸
+Rect tplRect = new Rect(w / 3, h / 3, tw, th);     // 取图中央偏左上一块
+Mat tpl = src.SubMat(tplRect).Clone();             // Clone! SubMat 是视图不拥有数据
+Console.WriteLine($"原图 {w}x{h}, 模板 {tw}x{th}（截自 ({tplRect.X},{tplRect.Y})）");
 
-// ---------- 2. 标准霍夫 HoughLines: 返回(ρ,θ)数学直线 ----------
-// 参数: (边缘图, 输出数组, rho分辨率=1像素, theta分辨率=1°, threshold=票数门槛)
-//   threshold=100: 参数空间某格子至少 100 票才算直线（相对阈值思想:
-//   图越大/边缘点越多，门槛该越高）
-LineSegmentPolar[] lines = Cv2.HoughLines(edges, 1, Math.PI / 180, 100);
-Console.WriteLine($"\n标准霍夫: 检出 {lines.Length} 条直线（无限长，只有(ρ,θ)参数）");
-
-// 画线: (ρ,θ) → 找直线上两个远端点连线（数学直线的可视化套路）
-//   直线方向 = (−sinθ, cosθ)（与法向(cosθ,sinθ)垂直）
-Mat stdDraw = src.Clone();
-foreach (LineSegmentPolar l in lines.Take(50))   // 最多画50条防花屏
+// ---------- 2. 手写暴力匹配（缩小图上验证原理） ----------
+// 对全图手写滑窗太慢(百万级窗口×每个窗口几万次运算),
+// 教学惯例: 缩到 1/4 尺寸做, 逻辑与全图完全一致
+Mat smallSrc = new Mat(), smallTpl = new Mat();
+Cv2.Resize(src, smallSrc, new Size(w / 4, h / 4), 0, 0, InterpolationFlags.Area);
+Cv2.Resize(tpl, smallTpl, new Size(tw / 4, th / 4), 0, 0, InterpolationFlags.Area);
+int sh = smallSrc.Height, sw = smallSrc.Width, sth = smallTpl.Height, stw = smallTpl.Width;
+if (!smallSrc.GetArray(out Vec3b[] sPx) || !smallTpl.GetArray(out Vec3b[] tPx))
 {
-    double rho = l.Rho, theta = l.Theta;
-    double a = Math.Cos(theta), b = Math.Sin(theta);
-    double x0 = a * rho, y0 = b * rho;                    // 垂足
-    Point p1 = new Point((int)(x0 + 1000 * -b), (int)(y0 + 1000 * a));
-    Point p2 = new Point((int)(x0 - 1000 * -b), (int)(y0 - 1000 * a));
-    Cv2.Line(stdDraw, p1, p2, new Scalar(0, 255, 0), 1);
+    Console.WriteLine("GetArray 失败");
+    return;
 }
-Console.WriteLine("标准版问题: 同一条边的多个(ρ,θ)近似解全被检出 → 画出来是粗粗一坨");
-
-// ---------- 3. 概率霍夫 HoughLinesP: 子集投票 + 返回线段 ----------
-// "概率"= 随机抽取部分边缘点投票（够票就提前收工）→ 快很多
-// 新参数:
-//   minLineLength=40: 短于此的线段不要（过滤碎线）
-//   maxLineGap=15:    同一直线上断口≤15像素的线段合并（桥接断裂）
-// 返回 LineSegmentP[]: 每条是(x1,y1)-(x2,y2)的实打实线段
-LineSegmentPoint[] segs = Cv2.HoughLinesP(edges, 1, Math.PI / 180, 80, 40, 15);
-Mat pDraw = src.Clone();
-foreach (LineSegmentPoint s in segs)
-    Cv2.Line(pDraw, s.P1, s.P2, new Scalar(0, 0, 255), 2);
-Console.WriteLine($"\n概率霍夫: {segs.Length} 条线段（红），自带长度过滤和断裂合并");
-
-// ---------- 4. 手写"投票共识"迷你版: 验证"共线点得高票" ----------
-// 不重写整个霍夫（累计器+峰值检测代码量大），只验证核心机制:
-//   造 5 个精确共线的点，统计"过它们的直线"哪个(θ,ρ)得票最高
-//   最高票格子的(θ,ρ)应正好是那条直线的参数
-Point2f[] pts = { new(10, 20), new(20, 40), new(30, 60), new(40, 80), new(50, 100) };
-// 这 5 个点在直线 y=2x 上 → 直线参数: θ=atan(1/2)≈63.43°方向... 法向角 θ 满足
-//   x·cosθ + y·sinθ = ρ 恒定。y=2x → 斜率2 → 方向角63.43° → 法向角 153.43°-90°=...
-// 直接扫描: θ 取 0~180° 每 1°，算 5 点的 ρ，找"5 个 ρ 几乎相等"的 θ
-double bestTheta = 0, bestSpread = double.MaxValue;
-for (int t = 0; t < 180; t++)
+// 手写 SQDIFF(差的平方和): 每个窗口位置, 累加所有像素所有通道的差的平方
+double bestScore = double.MaxValue; int bestX = -1, bestY = -1;
+for (int y = 0; y <= sh - sth; y++)                // 滑窗: 模板左上角的所有可能位置
 {
-    double th = t * Math.PI / 180;
-    double[] rhos = pts.Select(p => p.X * Math.Cos(th) + p.Y * Math.Sin(th)).ToArray();
-    double spread = rhos.Max() - rhos.Min();     // 共线 ⇔ 某个θ下ρ全部相等(离散=0)
-    if (spread < bestSpread) { bestSpread = spread; bestTheta = th; }
+    for (int x = 0; x <= sw - stw; x++)
+    {
+        long sq = 0;
+        for (int dy = 0; dy < sth; dy++)
+        {
+            int sRow = (y + dy) * sw, tRow = dy * stw;
+            for (int dx = 0; dx < stw; dx++)
+            {
+                Vec3b s = sPx[sRow + x + dx];
+                Vec3b t = tPx[tRow + dx];
+                sq += (long)(s.Item0 - t.Item0) * (s.Item0 - t.Item0)
+                    + (long)(s.Item1 - t.Item1) * (s.Item1 - t.Item1)
+                    + (long)(s.Item2 - t.Item2) * (s.Item2 - t.Item2);
+            }
+        }
+        if (sq < bestScore) { bestScore = sq; bestX = x; bestY = y; }
+    }
 }
-double bestRho = pts.Select(p => p.X * Math.Cos(bestTheta) + p.Y * Math.Sin(bestTheta)).Average();
-Console.WriteLine($"\n手写投票验证: 5个共线点(y=2x上)");
-Console.WriteLine($"  扫描θ找到 ρ 离散度最小的方向: θ={bestTheta * 180 / Math.PI:F1}°, ρ={bestRho:F2}");
-Console.WriteLine($"  理论值: 直线 y=2x 的法向 θ=atan2(1,2)... 即 {Math.Atan2(1, 2) * 180 / Math.PI:F1}°（核对: 应一致）");
-Console.WriteLine("  → 共线点在参数空间曲线相交、交点得满票 —— 霍夫的心脏");
+// API 对照(缩小图上同尺度比较)
+Mat resultSmall = new Mat();
+Cv2.MatchTemplate(smallSrc, smallTpl, resultSmall, TemplateMatchModes.SqDiff);
+// 坑: MinMaxIdx 的 minIdx/maxIdx 不是 out 参数, 要传预分配数组进去填充
+int[] apiMinLoc = new int[2];
+Cv2.MinMaxIdx(resultSmall, out double apiMin, out _, apiMinLoc, null!);
+Console.WriteLine($"\n手写 SQDIFF: 最优 ({bestX},{bestY}) 得分 {bestScore}");
+Console.WriteLine($"API  SqDiff: 最优 ({apiMinLoc[0]},{apiMinLoc[1]}) 得分 {apiMin:F0}");
+Console.WriteLine($"位置一致: {bestX == apiMinLoc[0] && bestY == apiMinLoc[1]}（应为 True）");
 
-// ---------- 5. HoughCircles: 圆的投票（3参数: 圆心x,y + 半径r） ----------
-// 圆要 3 个参数 → 参数空间是三维(θ不再适用)，投票更贵
-// 实现取巧: 先用梯度方向定位圆心(2D投票)，再沿半径投票定 r —— 两步降维
-// 参数: (输入, 方法HOUGH_GRADIENT, dp=累加器分辨率倒数, minDist=圆心最小间距,
-//        param1=Canny高阈值(内部自己跑Canny), param2=圆心票数门槛,
-//        minRadius, maxRadius)
-// minDist: 两个圆心靠太近只留票高的（防同一圆检出多个圆心）
-// param2 越小 → 检出越多但误检越多（又一个纯度/完整度权衡，同第7课H容差）
-Mat circlesImg = src.Clone();
-Cv2.GaussianBlur(gray, gray, new Size(9, 9), 2);   // 预模糊: 平滑边缘,投票更稳
-CircleSegment[] circles = Cv2.HoughCircles(gray, HoughModes.Gradient, 1.5,
-                                           gray.Rows / 8, 100, 60, 20, 120);
-foreach (CircleSegment c in circles)
-{
-    Cv2.Circle(circlesImg, (Point)c.Center, (int)c.Radius, new Scalar(0, 255, 0), 2);
-    Cv2.Circle(circlesImg, (Point)c.Center, 3, new Scalar(0, 0, 255), -1);  // 圆心标记
-}
-Console.WriteLine($"\n霍夫圆: 检出 {circles.Length} 个（绿圈+红心）");
-Console.WriteLine("参数提示: minRadius/maxRadius 卡住预期尺寸范围 = 最有效的降噪手段");
+// ---------- 3. 正式匹配: 全图 + TM_CCOEFF_NORMED ----------
+Mat result = new Mat();
+Cv2.MatchTemplate(src, tpl, result, TemplateMatchModes.CCoeffNormed);
+// 结果图尺寸 = (w-tw+1) x (h-th+1) —— 左上角可放置位置的个数
+// 每格 = 模板放该处时的相关系数(1=完美 0=无关 -1=负相关)
+int[] minLoc = new int[2], maxLoc = new int[2];   // 预分配, MinMaxIdx 填充
+Cv2.MinMaxIdx(result, out double minV, out double maxV, minLoc, maxLoc);
+Console.WriteLine($"\n全图匹配(TMQ_CCOEFF_NORMED): 结果图 {result.Width}x{result.Height}");
+Console.WriteLine($"  最优位置 ({maxLoc[0]},{maxLoc[1]}) 得分 {maxV:F4}（模板截自原图, 应≈1）");
+Console.WriteLine($"  最差得分 {minV:F4}（最不像的地方, 负相关=明暗相反）");
 
-// ---------- 6. 参数实验: HoughLinesP 的 threshold 与 maxLineGap ----------
-// threshold 80→150: 票数门槛提高 → 只要"更明显的直线" → 线变少但更可靠
-// maxLineGap 15→2:  断口桥接变弱 → 虚线/断裂边缘拆成碎段
-LineSegmentPoint[] segsStrict = Cv2.HoughLinesP(edges, 1, Math.PI / 180, 150, 60, 2);
-Mat strictDraw = src.Clone();
-foreach (LineSegmentPoint s in segsStrict)
-    Cv2.Line(strictDraw, s.P1, s.P2, new Scalar(255, 0, 0), 2);
-Console.WriteLine($"\n参数实验: threshold 80→150 + gap 15→2: {segs.Length} → {segsStrict.Length} 条");
-Console.WriteLine("  （门槛高+不桥接 = 检出少而硬，取舍同 Canny 双阈值/面积过滤）");
+// 画框定位: 结果图峰值位置 = 模板左上角位置, 框的尺寸 = 模板尺寸
+Mat matchDraw = src.Clone();
+Rect found = new Rect(maxLoc[0], maxLoc[1], tw, th);
+Cv2.Rectangle(matchDraw, found, new Scalar(0, 255, 0), 3);
+Cv2.PutText(matchDraw, $"score={maxV:F3}", new Point(found.X, found.Y - 8),
+            HersheyFonts.HersheySimplex, 0.7, new Scalar(0, 255, 0), 2);
 
-// ---------- 7. 展示 ----------
-Cv2.ImShow("1-Canny边缘(投票人)", edges);
-Cv2.ImShow("2-标准霍夫(无限长线,粗坨)", stdDraw);
-Cv2.ImShow("3-概率霍夫P(红线段)", pDraw);
-Cv2.ImShow("4-霍夫圆", circlesImg);
-Cv2.ImShow("5-严格参数(th150,gap2)", strictDraw);
+// 结果图可视化: 32F 值域[-1,1] → Normalize 到 0~255 才能看(第九课显示套路)
+Mat resultShow = new Mat();
+Cv2.Normalize(result, resultShow, 0, 255, NormTypes.MinMax);
+Mat result8u = new Mat();
+Cv2.ConvertScaleAbs(resultShow, result8u);
+Cv2.Circle(result8u, new Point(maxLoc[0], maxLoc[1]), 8, new Scalar(255), 2); // 峰值标记
+
+// ---------- 4. 参数实验: 三族方法的结果图对比 ----------
+// SqDiff:   谷底=目标(越小越像), 显示时是"暗点"
+// CCorr:    峰值=目标, 但整体偏亮(亮度干扰) → 目标峰不突出
+// CCoeff:   峰值=目标, 去均值后对比强烈 → 峰最锐利
+// 结论: 工程永远用带 _NORMED 的, 三族里 CCOEFF_NORMED 最稳
+Mat resSq = new Mat(), resCc = new Mat();
+Cv2.MatchTemplate(src, tpl, resSq, TemplateMatchModes.SqDiffNormed);
+Cv2.MatchTemplate(src, tpl, resCc, TemplateMatchModes.CCorrNormed);
+Mat showSq = new Mat(), showCc = new Mat();
+Cv2.Normalize(resSq, showSq, 0, 255, NormTypes.MinMax);
+Cv2.Normalize(resCc, showCc, 0, 255, NormTypes.MinMax);
+Mat showSq8 = new Mat(), showCc8 = new Mat();
+Cv2.ConvertScaleAbs(showSq, showSq8);
+Cv2.ConvertScaleAbs(showCc, showCc8);
+int[] sqMinLoc = new int[2];
+Cv2.MinMaxIdx(resSq, out _, out _, sqMinLoc, null!);   // SqDiff 反着: 最小才像
+Cv2.Circle(showSq8, new Point(sqMinLoc[0], sqMinLoc[1]), 8, new Scalar(255), 2);
+Console.WriteLine("\n参数实验: 三族结果图对比(都归一化显示)");
+Console.WriteLine("  SqDiffNormed: 目标=最暗点(注意'最小'才是答案)");
+Console.WriteLine("  CCorrNormed:  目标=亮点, 但被亮度背景糊住");
+Console.WriteLine("  CCoeffNormed: 目标=最锐利的亮点 ← 工程首选");
+
+// ---------- 5. 阈值判定: 匹配得分的工程意义 ----------
+// 工程上 maxV 不只是"找位置"—— 它是质量分数:
+//   ≥0.95 几乎完美 / 0.8~0.9 大概率是 / <0.6 很可疑
+// 第十四课的 OK/NG 判定就建立在这条分数带上
+Console.WriteLine($"\n得分解读: {maxV:F3} ≥ 0.95 → 模板与该区域高度一致");
+
+// ---------- 6. 展示 ----------
+Cv2.ImShow("1-模板(截自原图)", tpl);
+Cv2.ImShow("2-手写验证(缩小图)", smallSrc.Clone(new Rect(bestX, bestY, stw, sth)));
+Cv2.ImShow("3-匹配定位", matchDraw);
+Cv2.ImShow("4-结果图CCoeffNormed(峰=目标)", result8u);
+Cv2.ImShow("5-对比SqDiffNormed(谷=目标)", showSq8);
+Cv2.ImShow("6-对比CCorrNormed(峰糊)", showCc8);
 Cv2.WaitKey(0);
 Cv2.DestroyAllWindows();
 
 // ============================================================
 // 本课小结：
-// 1. 霍夫 = 参数空间投票: 边缘点→(θ,ρ)曲线, 曲线交点=共线共识=峰值
-// 2. 标准版返回无限长(ρ,θ)直线; 概率版P随机子集投票(快)+返回线段(实用)
-// 3. minLineLength/maxLineGap: 线段级过滤（太短的踢、断口的接）
-// 4. 圆=3参数投票, HoughCircles 用梯度先定圆心再定半径（两步降维）
-// 5. threshold/param2 是纯度-完整度旋钮（同 Canny 双阈值、面积5%门槛）
-// 6. 输入永远是 Canny 边缘图 —— 垃圾边缘进, 垃圾直线出
-// 练习建议: 换一张有明显直线结构的图(建筑/表格/跑道), 对比窗口2/3/5
+// 1. 模板匹配 = 滑窗算相似度(卷积的近亲), 输出相似度地图(结果图)
+// 2. 结果图每格 = "模板左上角放这的得分"; 定位 = 找峰值 MinMaxLoc
+// 3. 三族方法: SqDiff(小=像)/CCorr(大=像,怕亮)/CCoeff(去均值,最稳)
+// 4. _NORMED 后缀归一化到固定区间 → 分数跨图可比, 工程必带
+// 5. CCoeffNormed 得分: 1=完美 0=无关 -1=负相关; ≥0.95 视为命中
+// 6. SubMat 是视图不拥有数据, 要独立保存必须 Clone
+// 练习建议: 把模板改成图中另一个物体的截图, 再改半透明物体的, 看得分变化
 // ============================================================
