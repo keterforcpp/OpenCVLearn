@@ -109,6 +109,11 @@ Rect found = new Rect(maxLoc[0], maxLoc[1], tw, th);
 Cv2.Rectangle(matchDraw, found, new Scalar(0, 255, 0), 3);
 Cv2.PutText(matchDraw, $"score={maxV:F3}", new Point(found.X, found.Y - 8),
             HersheyFonts.HersheySimplex, 0.7, new Scalar(0, 255, 0), 2);
+// 机械自查: 模板出处画红框, 匹配结果画绿框 —— 两框应完全重叠(只看得见绿)
+Rect truthRect = new Rect(tplRect.X, tplRect.Y, tw, th);
+Cv2.Rectangle(matchDraw, truthRect, new Scalar(0, 0, 255), 1);
+Console.WriteLine($"  [自查] 模板出处=({tplRect.X},{tplRect.Y}), 匹配框=({found.X},{found.Y}), "
+                  + $"重合={(found.X == truthRect.X && found.Y == truthRect.Y)}（红框若露出=真错了）");
 
 // 结果图可视化: 32F 值域[-1,1] → Normalize 到 0~255 才能看(第九课显示套路)
 Mat resultShow = new Mat();
@@ -147,11 +152,11 @@ Console.WriteLine($"\n得分解读: {maxV:F3} ≥ 0.95 → 模板与该区域高
 
 // ---------- 6. 展示 ----------
 Cv2.ImShow("1-模板(截自原图)", tpl);
-Cv2.ImShow("2-手写验证(缩小图)", smallSrc.Clone(new Rect(bestX, bestY, stw, sth)));
+//Cv2.ImShow("2-手写验证(缩小图)", smallSrc.Clone(new Rect(bestX, bestY, stw, sth)));
 Cv2.ImShow("3-匹配定位", matchDraw);
 Cv2.ImShow("4-结果图CCoeffNormed(峰=目标)", result8u);
-Cv2.ImShow("5-对比SqDiffNormed(谷=目标)", showSq8);
-Cv2.ImShow("6-对比CCorrNormed(峰糊)", showCc8);
+//Cv2.ImShow("5-对比SqDiffNormed(谷=目标)", showSq8);
+//Cv2.ImShow("6-对比CCorrNormed(峰糊)", showCc8);
 Cv2.WaitKey(0);
 Cv2.DestroyAllWindows();
 
