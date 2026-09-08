@@ -88,24 +88,29 @@ Cv2.MatchTemplate(smallSrc, smallTpl, resultSmall, TemplateMatchModes.SqDiff);
 //      且两个数组都必须给(null 会被运行时拒绝), 不关心的也塞个占位数组
 int[] apiMinLoc = new int[2], apiMaxLoc = new int[2];
 Cv2.MinMaxIdx(resultSmall, out double apiMin, out _, apiMinLoc, apiMaxLoc);
+// 坑(本课最大坑): MinMaxIdx 返回的下标数组是 [行, 列] = [y, x]!
+//      Mat 的世界行优先(第一下标是行), OpenCV 全家沿用 ——
+//      下标[0]是 y、[1]是 x, 和 Point(x,y)、Rect(x,y,w,h) 的参数顺序相反
+int apiX = apiMinLoc[1], apiY = apiMinLoc[0];
 Console.WriteLine($"\n手写 SQDIFF: 最优 ({bestX},{bestY}) 得分 {bestScore}");
-Console.WriteLine($"API  SqDiff: 最优 ({apiMinLoc[0]},{apiMinLoc[1]}) 得分 {apiMin:F0}");
-Console.WriteLine($"位置一致: {bestX == apiMinLoc[0] && bestY == apiMinLoc[1]}（应为 True）");
+Console.WriteLine($"API  SqDiff: 最优 ({apiX},{apiY}) 得分 {apiMin:F0}");
+Console.WriteLine($"位置一致: {bestX == apiX && bestY == apiY}（应为 True）");
 
 // ---------- 3. 正式匹配: 全图 + TM_CCOEFF_NORMED ----------
 Mat result = new Mat();
 Cv2.MatchTemplate(src, tpl, result, TemplateMatchModes.CCoeffNormed);
 // 结果图尺寸 = (w-tw+1) x (h-th+1) —— 左上角可放置位置的个数
 // 每格 = 模板放该处时的相关系数(1=完美 0=无关 -1=负相关)
-int[] minLoc = new int[2], maxLoc = new int[2];   // 预分配, MinMaxIdx 填充
+int[] minLoc = new int[2], maxLoc = new int[2];   // 预分配, MinMaxIdx 填充([0]=y,[1]=x)
 Cv2.MinMaxIdx(result, out double minV, out double maxV, minLoc, maxLoc);
+int mx = maxLoc[1], my = maxLoc[0];               // 换回 x,y 顺序
 Console.WriteLine($"\n全图匹配(TMQ_CCOEFF_NORMED): 结果图 {result.Width}x{result.Height}");
-Console.WriteLine($"  最优位置 ({maxLoc[0]},{maxLoc[1]}) 得分 {maxV:F4}（模板截自原图, 应≈1）");
+Console.WriteLine($"  最优位置 ({mx},{my}) 得分 {maxV:F4}（模板截自原图, 应≈1）");
 Console.WriteLine($"  最差得分 {minV:F4}（最不像的地方, 负相关=明暗相反）");
 
 // 画框定位: 结果图峰值位置 = 模板左上角位置, 框的尺寸 = 模板尺寸
 Mat matchDraw = src.Clone();
-Rect found = new Rect(maxLoc[0], maxLoc[1], tw, th);
+Rect found = new Rect(mx, my, tw, th);
 Cv2.Rectangle(matchDraw, found, new Scalar(0, 255, 0), 3);
 Cv2.PutText(matchDraw, $"score={maxV:F3}", new Point(found.X, found.Y - 8),
             HersheyFonts.HersheySimplex, 0.7, new Scalar(0, 255, 0), 2);
@@ -120,7 +125,7 @@ Mat resultShow = new Mat();
 Cv2.Normalize(result, resultShow, 0, 255, NormTypes.MinMax);
 Mat result8u = new Mat();
 Cv2.ConvertScaleAbs(resultShow, result8u);
-Cv2.Circle(result8u, new Point(maxLoc[0], maxLoc[1]), 8, new Scalar(255), 2); // 峰值标记
+Cv2.Circle(result8u, new Point(mx, my), 8, new Scalar(255), 2); // 峰值标记
 
 // ---------- 4. 参数实验: 三族方法的结果图对比 ----------
 // SqDiff:   谷底=目标(越小越像), 显示时是"暗点"
@@ -138,7 +143,7 @@ Cv2.ConvertScaleAbs(showSq, showSq8);
 Cv2.ConvertScaleAbs(showCc, showCc8);
 int[] sqMinLoc = new int[2], sqMaxLoc = new int[2];
 Cv2.MinMaxIdx(resSq, out _, out _, sqMinLoc, sqMaxLoc);   // SqDiff 反着: 最小才像
-Cv2.Circle(showSq8, new Point(sqMinLoc[0], sqMinLoc[1]), 8, new Scalar(255), 2);
+Cv2.Circle(showSq8, new Point(sqMinLoc[1], sqMinLoc[0]), 8, new Scalar(255), 2);  // [0]=y,[1]=x
 Console.WriteLine("\n参数实验: 三族结果图对比(都归一化显示)");
 Console.WriteLine("  SqDiffNormed: 目标=最暗点(注意'最小'才是答案)");
 Console.WriteLine("  CCorrNormed:  目标=亮点, 但被亮度背景糊住");
