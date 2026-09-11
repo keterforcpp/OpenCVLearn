@@ -90,7 +90,7 @@ if (!result.GetArray(out float[] scores))
     return;
 }
 int rh = result.Height, rw = result.Width;
-double threshold = 0.65;    // 命中门槛: 得分低于此不算目标(第十二课分数带的下沿)
+double threshold = 0.33;    // 命中门槛: 得分低于此不算目标(第十二课分数带的下沿)
 Console.WriteLine($"\n开始多目标提取(阈值 {threshold}):");
 
 // 检测框列表
